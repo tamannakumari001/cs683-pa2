@@ -1,0 +1,524 @@
+\documentclass[11pt,a4paper]{article}
+
+% ------------------------------------------------------------ fonts / layout
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[margin=1in]{geometry}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{caption}
+\usepackage{needspace}
+\usepackage{etoolbox}
+\usepackage{listings}
+\usepackage[hidelinks]{hyperref}
+
+\graphicspath{{../results/}}
+
+% ------------------------------------------------------------------- colours
+\definecolor{accent}{HTML}{1F4E79}      % headings, rules
+\definecolor{codebg}{HTML}{F6F8FA}      % listing background
+\definecolor{codeframe}{HTML}{D0D7DE}
+\definecolor{codekw}{HTML}{0550AE}      % keywords
+\definecolor{codecom}{HTML}{6E7781}     % comments
+\definecolor{codenum}{HTML}{8C959F}     % line numbers
+\definecolor{codestr}{HTML}{0A3069}
+
+% ------------------------------------------------------- paragraphs / lists
+\linespread{1.08}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.55em}
+\setlist[itemize]{leftmargin=1.5em, itemsep=0.25em, topsep=0.3em, parsep=0pt}
+\setlist[enumerate]{leftmargin=1.7em, itemsep=0.25em, topsep=0.3em, parsep=0pt}
+
+% ----------------------------------------------------------------- headings
+\titleformat{\section}
+    {\Large\bfseries\color{accent}}{\thesection}{0.7em}{}[\vspace{-0.3em}\color{accent}\titlerule]
+\titleformat{\subsection}
+    {\large\bfseries\color{accent}}{\thesubsection}{0.7em}{}
+\titleformat{\subsubsection}
+    {\normalsize\bfseries}{\thesubsubsection}{0.7em}{}
+\titleformat{\paragraph}[hang]
+    {\normalfont\bfseries\color{accent}}{}{0em}{}
+\titlespacing*{\section}{0pt}{1.6em}{0.9em}
+\titlespacing*{\subsection}{0pt}{1.3em}{0.5em}
+\titlespacing*{\subsubsection}{0pt}{1.0em}{0.4em}
+\titlespacing*{\paragraph}{0pt}{1.1em}{0.4em}
+
+% keep a heading together with at least a few lines of the text that follows it
+\pretocmd{\section}{\needspace{8\baselineskip}}{}{}
+\pretocmd{\subsection}{\needspace{6\baselineskip}}{}{}
+\pretocmd{\subsubsection}{\needspace{5\baselineskip}}{}{}
+\pretocmd{\paragraph}{\needspace{5\baselineskip}}{}{}
+
+% --------------------------------------------------------- header / footer
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\color{codecom} CS683 Programming Assignment -2 report}
+\fancyhead[R]{\small\color{codecom} \leftmark}
+\fancyfoot[C]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\headrule}{\hbox to\headwidth{\color{codeframe}\leaders\hrule height \headrulewidth\hfill}}
+\renewcommand{\sectionmark}[1]{\markboth{#1}{#1}}
+\setlength{\headheight}{14pt}
+
+% ------------------------------------------------------- tables / captions
+\renewcommand{\arraystretch}{1.25}
+\captionsetup{font=small, labelfont={bf,color=accent}, skip=6pt}
+
+% -------------------------------------------------------------- code listings
+\lstdefinestyle{champsim}{
+    language=C++,
+    basicstyle=\ttfamily\footnotesize,
+    keywordstyle=\color{codekw}\bfseries,
+    commentstyle=\color{codecom}\itshape,
+    stringstyle=\color{codestr},
+    numberstyle=\tiny\color{codenum},
+    numbers=left, numbersep=16pt,
+    backgroundcolor=\color{codebg},
+    frame=l, rulecolor=\color{accent}, framerule=2pt,
+    framexleftmargin=6pt, xleftmargin=3.4em,
+    aboveskip=0.1em, belowskip=0pt,
+    breaklines=true, breakatwhitespace=false,
+    columns=fullflexible, keepspaces=true, tabsize=4,
+    showstringspaces=false,
+    morekeywords={uint8_t, uint16_t, uint32_t, uint64_t, int64_t, CACHE, assert},
+}
+\lstset{style=champsim}
+
+% Marks a spot that still has to be filled in (red box); easy to grep for.
+\newcommand{\todo}[1]{\colorbox{red!12}{\textcolor{red!70!black}{\small [TODO: #1]}}}
+
+% ---------------------------------------------------------------- title page
+\begin{document}
+
+\begin{titlepage}
+    \thispagestyle{empty}
+    \centering
+    \vspace*{0.28\textheight}
+    {\color{accent}\rule{0.8\textwidth}{1.2pt}\par}
+    \vspace{1.0cm}
+    {\fontsize{21}{26}\selectfont\bfseries\color{accent} CS683 Programming Assignment -2 report\par}
+    \vspace{1.0cm}
+    {\color{accent}\rule{0.8\textwidth}{1.2pt}\par}
+    \vspace{1.4cm}
+    {\large Submitted by: 24B1015, 24B0995, 24B1021, 24B1037\par}
+    \vfill
+\end{titlepage}
+
+% ================================================================= TASK 1
+\section{Task 1: Stride Pattern Prefetching}
+
+% ---------------------------------------------------------------- Task 1A
+\subsection{Task 1A: Understanding the IP-stride prefetcher}
+\label{sec:task1a}
+
+\subsubsection{How the prefetcher works}
+
+The IP-stride prefetcher (\texttt{prefetcher/ip\_stride.l1d\_pref}) sits at the L1 data
+cache. Its idea is that a single load or store instruction, identified by its instruction
+pointer (IP), tends to walk through memory with a constant stride (for example, a loop
+over an array). It remembers the last address each IP touched, computes the stride between
+consecutive accesses of that IP, and once the same stride is seen twice in a row it
+prefetches the next few addresses along that stride. The code is walked through below,
+section by section; the line numbers in the listings are the line numbers in the source file.
+
+\paragraph{1.\ Parameters and the tracker entry (lines 4--30).}
+\lstinputlisting[language=C++, firstline=4, lastline=30, firstnumber=4]{../prefetcher/ip_stride.l1d_pref}
+\begin{itemize}
+    \item \texttt{IP\_TRACKER\_COUNT = 24}: the prefetching table has only 24 entries.
+    \item \texttt{PREFETCH\_DEGREE = 3}: when the prefetcher fires it issues 3 prefetches. The
+          degree is fixed and never changes.
+    \item \texttt{MASK\_IP = 0xFF}: only the low 8 bits of the IP are used to identify an
+          instruction. Different instructions whose IPs share the low 8 bits therefore
+          share one tracker (aliasing).
+    \item Each \texttt{IP\_TRACKER} entry stores: the (masked) IP it belongs to; the cache-line
+          address of the last access by that IP (\texttt{last\_cl\_addr}); the stride observed
+          between its last two accesses (\texttt{last\_stride}, signed, in cache lines); and an
+          LRU rank used to choose which entry to replace when the table is full.
+    \item The table \texttt{trackers[]} is a single global array, so it is shared by everything that
+          uses this prefetcher (fine for the single-core configuration used here).
+\end{itemize}
+
+\paragraph{2.\ Initialisation (lines 33--39).}
+\lstinputlisting[language=C++, firstline=33, lastline=39, firstnumber=33]{../prefetcher/ip_stride.l1d_pref}
+This function is called once when the simulation starts. It prints a banner and gives the 24
+entries the distinct LRU ranks $0,1,\dots,23$. Rank 0 means most recently used and rank 23
+(\texttt{IP\_TRACKER\_COUNT-1}) means least recently used, so at any time the ranks form a
+permutation of $0\ldots23$ and exactly one entry is the replacement victim. All entries start
+with \texttt{ip = 0}, \texttt{last\_cl\_addr = 0} and \texttt{last\_stride = 0}.
+
+\paragraph{3.\ Entry point: cache-line address and IP (lines 41--46).}
+\lstinputlisting[language=C++, firstline=41, lastline=46, firstnumber=41]{../prefetcher/ip_stride.l1d_pref}
+\texttt{l1d\_prefetcher\_operate} is called by the L1D for each access it handles. The
+prefetcher works on cache lines, not bytes: shifting the byte address right by
+\texttt{LOG2\_BLOCK\_SIZE} drops the offset inside the 64-byte line, giving \texttt{cl\_addr}.
+The IP is reduced to its low 8 bits. The arguments \texttt{cache\_hit} and \texttt{type} are
+not used in this file, so the prefetcher trains on every access it is called for, whether it
+hit or missed in the L1D.
+
+\paragraph{4.\ Looking up the tracker (lines 48--52).}
+\lstinputlisting[language=C++, firstline=48, lastline=52, firstnumber=48]{../prefetcher/ip_stride.l1d_pref}
+The table is fully associative: a linear search compares the masked IP against every entry.
+If an entry matches, the loop \texttt{break}s with \texttt{index} pointing at it. If none
+matches, the loop runs to the end and \texttt{index} equals \texttt{IP\_TRACKER\_COUNT}.
+
+\paragraph{5.\ A new IP: allocating a tracker (lines 54--74).}
+\lstinputlisting[language=C++, firstline=54, lastline=74, firstnumber=54]{../prefetcher/ip_stride.l1d_pref}
+\begin{itemize}
+    \item \textbf{Choosing the victim (57--60).} The entry whose LRU rank is 23 (the least
+          recently used) is selected for replacement.
+    \item \textbf{Initialising it (62--64).} The entry is overwritten with the new IP and the
+          current line address. \texttt{last\_stride} is set to 0 because no stride is known yet.
+    \item \textbf{LRU update (67--71).} Every entry that was more recently used than the victim
+          (rank smaller than the victim's) moves one step towards ``old'' (rank $+1$), and the new
+          entry becomes rank 0. Since the victim had rank 23, all other entries are incremented
+          and the ranks remain a permutation.
+    \item \textbf{No prefetch (73).} With only one address seen, there is no stride to
+          compute, so the function returns without prefetching.
+\end{itemize}
+
+\paragraph{6.\ Sanity check and stride calculation (lines 76--90).}
+\lstinputlisting[language=C++, firstline=76, lastline=90, firstnumber=76]{../prefetcher/ip_stride.l1d_pref}
+When execution reaches here, a tracker for this IP exists. The \texttt{assert} guards against
+an impossible state. The stride is the difference between the current and the previous cache-line
+address of this IP, in units of cache lines. Because the addresses are unsigned, the code
+subtracts the smaller from the larger and negates the result if the access moved backwards, so a
+descending access pattern gives a negative stride.
+
+\paragraph{7.\ Ignoring repeated lines (lines 94--96).}
+\lstinputlisting[language=C++, firstline=94, lastline=96, firstnumber=94]{../prefetcher/ip_stride.l1d_pref}
+A stride of 0 means the same cache line was accessed again (for example several accesses to the
+same line). There is nothing to learn or prefetch from that, so the function returns early. Note
+that this early return does \emph{not} update \texttt{last\_cl\_addr}, \texttt{last\_stride} or the
+LRU ranks.
+
+\paragraph{8.\ The trigger and the prefetch loop (lines 98--117).}
+\lstinputlisting[language=C++, firstline=98, lastline=117, firstnumber=98]{../prefetcher/ip_stride.l1d_pref}
+\begin{itemize}
+    \item \textbf{Trigger (100).} Prefetching only happens if the new stride equals the stored
+          \texttt{last\_stride}, i.e.\ the same stride has been seen twice in a row. This is the
+          prefetcher's only form of confidence: one repetition. Since a new entry starts with
+          \texttt{last\_stride = 0}, an IP needs three accesses before its first prefetch (the first
+          allocates the entry, the second records the stride, the third confirms it).
+    \item \textbf{Addresses (103--104).} For $i = 0,1,2$ it prefetches the line at
+          \texttt{cl\_addr + stride $\cdot (i+1)$}, converted back to a byte address, so with stride $s$
+          it prefetches the next three lines along the pattern. 
+    \item \textbf{Page boundary (108--109).} The prefetch address must be in the same 4~KB page as
+          the demand access (the usual reason is that consecutive
+          pages are not necessarily contiguous or even mapped, so a stride run cannot safely be
+          followed across a page. Also the prefetcher does not know whether the next page is actually valid/mapped.). On the first violation the loop
+          stops, since the later prefetches in the same direction would also be outside the page.
+    \item \textbf{Fill level (112--115).} \texttt{prefetch\_line} hands the request to the cache. If
+          fewer than half of the L1D MSHR entries are in use the line is brought into the L1D
+          (\texttt{FILL\_L1}); otherwise it is only brought into the L2 (\texttt{FILL\_L2}), so that
+          prefetches do not use up the miss-handling resources that demand misses need.
+\end{itemize}
+
+\paragraph{9.\ Updating the entry (lines 119--128).}
+\lstinputlisting[language=C++, firstline=119, lastline=128, firstnumber=119]{../prefetcher/ip_stride.l1d_pref}
+Whether or not a prefetch was issued, the entry now remembers the current line address and the
+current stride, ready for the next access of this IP. The entry then becomes the most recently
+used: every entry that was more recent than it is aged by one and it gets rank 0. Note that only
+the \emph{last} stride is kept as history; one irregular access overwrites it.
+
+\paragraph{10.\ Fill hook and final statistics (lines 130--139).}
+\lstinputlisting[language=C++, firstline=130, lastline=139, firstnumber=130]{../prefetcher/ip_stride.l1d_pref}
+\texttt{l1d\_prefetcher\_cache\_fill} is called whenever a line is filled into the L1D. This
+prefetcher does not use it (the body just returns). \texttt{l1d\_prefetcher\_final\_stats} prints the
+degree at the end of the simulation. There is no accuracy tracking in this prefetcher; the
+accuracy reported in the results comes from ChampSim's own prefetch counters.
+
+\subsubsection{Limitations}
+The IP-stride prefetcher only works for accesses with one constant stride per IP. Its main
+limitations, which motivate SPP, are:
+\begin{itemize}
+    \item \textbf{No tolerance to irregularity.} Each entry stores a single stride and a single
+          previous address, and a prefetch is issued only when $s_n = s_{n-1}$, where
+          $s_n = A_n - A_{n-1}$. One irregular access overwrites \texttt{last\_stride}, so the
+          next access cannot match it and the stride has to be re-learned and re-confirmed. A single
+          irregular access therefore suppresses prefetching for about two subsequent accesses.
+          There is no confidence counter that could absorb such noise.
+    \item \textbf{Cannot learn alternating or periodic strides.} Patterns whose stride sequence is
+          periodic but not constant, such as $\{+1,+3,+1,+3,\dots\}$, never produce two equal
+          consecutive strides, so no prefetch is ever issued even though the pattern is fully
+          predictable. Typical sources are structure-of-fields traversals, padded 2D arrays and
+          nested loops. Only one delta of history is kept, so such patterns cannot be captured.
+    \item \textbf{No support for irregular or indirect accesses.} Pointer chasing and indirect
+          accesses such as \texttt{A[B[i]]} have no constant stride, so the prefetcher gives no
+          benefit and only trains on noise.
+    \item \textbf{Training delay.} An IP needs three accesses before its first prefetch, which
+          hurts short loops and short streams.
+    \item \textbf{Page boundary.} Prefetching stops at the 4\,KB page boundary and each new page
+          has to be trained again, so the lookahead is truncated near the end of every page.
+    \item \textbf{Fixed degree and no feedback.} The degree is fixed and is not adapted to
+          accuracy or timeliness, so the prefetcher may be too aggressive on irregular code
+          (cache pollution, wasted bandwidth) or too shallow on regular code.
+    \item \textbf{Per-IP table pressure.} Training state is kept per IP in a small LRU table.
+          Programs with many load IPs thrash it, and patterns learned by one IP cannot be shared
+          with other IPs that behave identically.
+\end{itemize}
+SPP addresses these by keeping a history of several recent deltas (a signature) and by predicting
+the next delta from that history, so alternating patterns can be captured and a single irregular
+access does not destroy the learned state.
+
+\subsubsection{Results}
+
+All runs use 25M warmup and 25M simulated instructions, with LRU at the L2C. The baseline is the
+same configuration with no L1D prefetcher. Speedup is $\mathrm{IPC}_{\text{IP-stride}} /
+\mathrm{IPC}_{\text{baseline}}$, and coverage is $(\text{L1D load misses}_{\text{base}} -
+\text{L1D load misses}_{\text{IP-stride}}) / \text{L1D load misses}_{\text{base}}$. Accuracy is the
+\texttt{ACCURACY} value printed by ChampSim for the L1D, which is the number of useful prefetches
+divided by the number of prefetches \emph{issued to the lower level} (the prefetches that missed
+in the L1D and went to the L2), not by all prefetches requested by the prefetcher.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{llrrrrr}
+        \toprule
+        Trace & Prefetcher & IPC & Speedup & L1D load MPKI & Accuracy (\%) & Coverage (\%) \\
+        \midrule
+        Trace1-001 & Baseline  & 0.2323 & 1.000 & 10.68 & --   & --  \\
+                   & IP-stride & 0.2333 & 1.005 & 10.12 & 53.0 & 5.3 \\
+        \midrule
+        Trace2-002 & Baseline  & 0.2506 & 1.000 & 13.54 & --   & --  \\
+                   & IP-stride & 0.2505 & 1.000 & 13.44 & 38.2 & 0.7 \\
+        \midrule
+        Trace3-001 & Baseline  & 0.3820 & 1.000 & 3.40  & --   & --  \\
+                   & IP-stride & 0.3829 & 1.002 & 3.32  & 16.0 & 2.5 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Baseline versus IP-stride (degree 3) on the three traces.}
+    \label{tab:task1a-main}
+\end{table}
+
+Table~\ref{tab:task1a-main} shows that IP-stride is almost neutral on these traces. Table~\ref{tab:task1a-pf}
+gives the prefetch counters behind the accuracy and coverage numbers.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{lrrrrrr}
+        \toprule
+        Trace & Queued & Hit in L1D & To lower level & Useful & Useless & Late \\
+        \midrule
+        Trace1-001 & 155\,922 & 102\,542 & 30\,956 & 16\,408 & 8\,834  & 2\,807 \\
+        Trace2-002 & 78\,701  & 57\,796  & 11\,426 & 4\,361  & 6\,300  & 272    \\
+        Trace3-001 & 103\,500 & 70\,396  & 17\,007 & 2\,713  & 10\,595 & 3\,067 \\
+        \bottomrule
+    \end{tabular}
+    \caption{L1D prefetch counters of IP-stride. ``Queued'' is the number of prefetch requests put
+    into the L1D prefetch queue (the \texttt{L1D PQ ACCESS} line). ``Hit in L1D'' is the number of
+    queued prefetches whose line was already in the L1D. ``To lower level'' is the denominator
+    ChampSim uses for accuracy. No prefetch crosses a page boundary.}
+    \label{tab:task1a-pf}
+\end{table}
+
+\paragraph{Observations.}
+\begin{itemize}
+    \item \textbf{Performance gain is negligible.} The speedups are $1.005$, $1.000$ and $1.002$,
+          so IP-stride changes IPC by at most 0.5\%.
+    \item \textbf{Coverage is low}, only $5.3\%$, $0.7\%$ and $2.5\%$ of the baseline L1D load misses
+          are removed. Trace2 gains almost nothing, and it is also the trace with the highest baseline
+          L1D load MPKI ($13.5$), so there is plenty of room that the prefetcher does not use.
+    \item \textbf{Accuracy varies a lot between traces}: $53.0\%$, $38.2\%$ and $16.0\%$. In Trace3
+          the useless prefetches ($10\,595$) are almost four times the useful ones ($2\,713$), and the
+          late prefetches ($3\,067$) outnumber the useful ones, so many prefetches also arrive after
+          the demand access.
+    \item \textbf{Most prefetches never leave the L1D.} Of the prefetches that look up the L1D, $80.2\%$,
+          $84.4\%$ and $84.1\%$ (Trace1, 2, 3) find the line already present (the \texttt{L1D PREFETCH}
+          hit rate), so they fetch nothing. Only $19.9\%$, $14.5\%$ and $16.4\%$ of the queued
+          prefetches go to the L2 (``To lower level'' over ``Queued''). The rest hit in the L1D or
+          merge with a request already in the queue (about 8\% of the queued prefetches). The
+          prefetcher therefore re-requests the same lines many times: lookups with no benefit.
+    \item \textbf{ChampSim's ``ISSUED'' counts every prefetch twice.} In this build, \texttt{pf\_issued}
+          is incremented once when the prefetch enters the queue and again when its translation
+          request is sent to the STLB, so $\texttt{ISSUED} = \texttt{PQ ACCESS} + \texttt{PQ TO\_CACHE}$
+          exactly in all three traces (for Trace1, $155\,922 + 142\,926 = 298\,848$). We therefore
+          report the number of queued prefetches instead of ``ISSUED''.
+    \item \textbf{Page-boundary rule works.} There are zero cross-page prefetches in all traces,
+          as the code intends.
+    \item \textbf{Trace3 has the least to gain}: its baseline L1D load MPKI is already low ($3.40$),
+          so even a perfect prefetcher could remove only a small number of misses.
+\end{itemize}
+These results are the reference point for the SPP evaluation. 
+% ---------------------------------------------------------------- Task 1B
+\subsection{Task 1B: Stride Pattern Prefetcher (SPP)}
+\label{sec:task1b}
+
+\subsubsection{Design}
+\todo{prefetching table, uniform/non-uniform classification, signature, fallback, degree, page limit}
+
+\subsubsection{Storage overhead}
+\todo{exact bit-level breakdown of every table entry and the total}
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{llrrr}
+        \toprule
+        Table & Field & Bits per entry & Entries & Total bits \\
+        \midrule
+        \todo{} & & & & \\
+        \bottomrule
+    \end{tabular}
+    \caption{Storage overhead of SPP.}
+\end{table}
+
+\subsubsection{Accuracy-based throttling}
+\paragraph{Threshold selection.}
+\todo{what the accuracy thresholds are and how they were decided}
+
+\paragraph{Choice of prefetch degrees.}
+\todo{why these degrees for the different accuracy ranges}
+
+\subsubsection{Results}
+\todo{IPC, speedup, L1D load MPKI, accuracy, coverage: baseline vs IP-stride vs SPP}
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{llrrrrr}
+        \toprule
+        Trace & Prefetcher & IPC & Speedup & L1D load MPKI & Accuracy (\%) & Coverage (\%) \\
+        \midrule
+        \todo{} & & & & & & \\
+        \bottomrule
+    \end{tabular}
+    \caption{Task 1 results.}
+\end{table}
+
+\begin{figure}[H]
+    \centering
+    \todo{speedup plot}
+    \caption{Speedup over the no-prefetching baseline.}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \todo{L1D load MPKI plot}
+    \caption{L1D load MPKI.}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \todo{accuracy plot}
+    \caption{L1D prefetch accuracy.}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \todo{coverage plot}
+    \caption{L1D prefetch coverage.}
+\end{figure}
+
+\subsubsection{Discussion}
+\todo{where SPP wins or loses against IP-stride, and why}
+
+% ================================================================= TASK 2
+\section{Task 2: Cache Replacement Policy}
+
+% ---------------------------------------------------------------- Task 2A
+\subsection{Task 2A: Instruction-conscious L2 replacement (I-RRIP)}
+\label{sec:task2a}
+
+\subsubsection{Design}
+\todo{changes to \texttt{update\_replacement\_state}, insertion, promotion, eviction}
+
+\subsubsection{Rationale}
+\todo{why insertion, promotion and eviction were modified or not modified, and why this choice is best}
+
+\subsubsection{Results}
+\todo{IPC, speedup, Load MPKI of L2C, L2 Instruction and L2 Data}
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{llrrrrr}
+        \toprule
+        Trace & Policy & IPC & Speedup & L2C load MPKI & L2 instr.\ MPKI & L2 data MPKI \\
+        \midrule
+        \todo{} & & & & & & \\
+        \bottomrule
+    \end{tabular}
+    \caption{Task 2A results.}
+\end{table}
+
+\todo{plots}
+
+% ---------------------------------------------------------------- Task 2B
+\subsection{Task 2B: Dynamic I-RRIP}
+\label{sec:task2b}
+
+\subsubsection{Design}
+\todo{set dueling, leader sets, decision formula}
+
+\subsubsection{Rationale for the leader sets and decision logic}
+\todo{number of leader sets and why; decision logic and why}
+
+\subsubsection{Sensitivity study}
+\todo{5 values of the decision parameter (e.g.\ threshold) and their effect}
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{lrrrrr}
+        \toprule
+        Parameter value & IPC & Speedup & L2C load MPKI & L2 instr.\ MPKI & L2 data MPKI \\
+        \midrule
+        \todo{} & & & & & \\
+        \bottomrule
+    \end{tabular}
+    \caption{Sensitivity of Dynamic I-RRIP to its decision parameter.}
+\end{table}
+
+\subsubsection{Results}
+\todo{IPC, speedup, Load MPKI of L2C, L2 Instruction and L2 Data}
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{llrrrrr}
+        \toprule
+        Trace & Policy & IPC & Speedup & L2C load MPKI & L2 instr.\ MPKI & L2 data MPKI \\
+        \midrule
+        \todo{} & & & & & & \\
+        \bottomrule
+    \end{tabular}
+    \caption{Task 2B results.}
+\end{table}
+
+\todo{plots}
+
+% ================================================================= TASK 3
+\section{Task 3: Incorporating SPP with Dynamic I-RRIP}
+\label{sec:task3}
+
+\subsection{Design}
+\todo{prefetch awareness in \texttt{replacement/dyn\_irrip.l2c\_repl}}
+
+\subsection{Rationale for handling prefetch packets}
+\todo{why the replacement policy treats prefetch packets this way}
+
+\subsection{Results}
+\todo{IPC, speedup, prefetch accuracy, coverage, Load MPKI of L1D, L2C, L2 Instruction and L2 Data}
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{llrrrrrrrr}
+        \toprule
+        Trace & Config & IPC & Speedup & Acc.\ (\%) & Cov.\ (\%) & L1D MPKI & L2C MPKI & L2 instr.\ MPKI & L2 data MPKI \\
+        \midrule
+        \todo{} & & & & & & & & & \\
+        \bottomrule
+    \end{tabular}
+    \caption{Task 3 results: SPP + Dynamic I-RRIP versus SPP alone and Dynamic I-RRIP alone.}
+\end{table}
+
+\todo{plots}
+
+\subsection{Discussion}
+\todo{comparison against standalone SPP and standalone Dynamic I-RRIP}
+
+\end{document}

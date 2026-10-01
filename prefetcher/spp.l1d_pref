@@ -1,6 +1,10 @@
 #include "cache.h"
 
 
+#define IP_TRACKER_COUNT 24
+#define IP_TAG_BITS 12
+
+
 void CACHE::l1d_prefetcher_initialize() 
 {
     std::cout << "------------------------------------------------" << std::endl;
