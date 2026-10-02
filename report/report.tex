@@ -595,7 +595,72 @@ The measured accuracy of IP-stride on our traces (53\,\%, 38\,\% and 16\,\%, Tab
 also lies around and below the lower threshold, which shows that a low-accuracy region needs to be
 handled explicitly.
 
-\todo{how the thresholds were decided: add the fixed-degree sweep and the $(T_{\text{low}},T_{\text{high}})$ sweep (IPC, accuracy, coverage per setting) and state that 40/75 gave the best geometric-mean speedup}
+\paragraph{How the thresholds were decided.}
+The starting values 40\,\% and 75\,\% came from the reasoning above. We then checked them
+experimentally. All other SPP parameters were kept at their final values, and only the
+throttle was changed. Each setting was run on all three traces (25\,M warm-up + 25\,M simulated
+instructions). Table~\ref{tab:spp-thr-sweep} compares the chosen setting with three other threshold
+pairs and two other degree sets. Speedup and coverage are relative to the no-prefetching baseline.
+Accuracy is ChampSim's L1D accuracy, as in Task 1A.
+
+\begin{table}[H]
+    \centering
+    \small
+    \setlength{\tabcolsep}{4pt}
+    \begin{tabular}{ll rrr r rrr rrr}
+        \toprule
+        & & \multicolumn{3}{c}{Speedup} & & \multicolumn{3}{c}{Coverage (\%)} & \multicolumn{3}{c}{Accuracy (\%)} \\
+        \cmidrule(lr){3-5}\cmidrule(lr){7-9}\cmidrule(lr){10-12}
+        $T_{\text{low}}/T_{\text{high}}$ & Degrees & T1 & T2 & T3 & Geomean & T1 & T2 & T3 & T1 & T2 & T3 \\
+        \midrule
+        \textbf{40/75} & \textbf{1/2/4} & \textbf{1.0042} & \textbf{0.9997} & \textbf{1.0038} & \textbf{1.0026} & 5.4 & 0.7 & 4.3 & 57.0 & 46.6 & 26.1 \\
+        30/60 & 1/2/4 & 1.0041 & 0.9995 & 1.0039 & 1.0025 & 5.6 & 0.7 & 4.5 & 55.9 & 43.5 & 24.8 \\
+        50/85 & 1/2/4 & 1.0040 & 0.9998 & 1.0038 & 1.0025 & 5.1 & 0.7 & 3.8 & 58.2 & 50.3 & 27.0 \\
+        60/90 & 1/2/4 & 1.0039 & 0.9999 & 1.0034 & 1.0024 & 5.0 & 0.7 & 3.6 & 58.6 & 51.6 & 27.2 \\
+        \midrule
+        40/75 & 1/3/6 & 1.0040 & 0.9996 & 1.0039 & 1.0025 & 5.8 & 0.7 & 4.4 & 54.9 & 42.9 & 23.7 \\
+        40/75 & 2/4/8 & 1.0037 & 0.9994 & 1.0038 & 1.0023 & 5.9 & 0.7 & 4.7 & 52.5 & 40.3 & 22.8 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Throttle sweep: threshold pairs and degree sets (T1--T3 = Trace1-001, Trace2-002, Trace3-001).}
+    \label{tab:spp-thr-sweep}
+\end{table}
+
+Lower thresholds (30/60) keep the prefetcher at degree 4 more often. Coverage rises slightly, but
+accuracy drops by 1--3 points and the geometric-mean speedup does not improve. Higher thresholds
+(50/85, 60/90) move many epochs from degree 4 to degree 2. Accuracy rises, but coverage falls,
+most clearly on Trace3 (4.3\,\% $\to$ 3.6\,\%), and the speedup drops. The pair 40/75 has the
+highest geometric-mean speedup, so we kept it. The differences between all settings are small
+(below 0.03\,\% in geometric-mean speedup). The traces offer little headroom for an L1D prefetcher
+(Section~\ref{sec:task1a}), so the throttle mainly changes the number of prefetches, not the IPC.
+
+\paragraph{Which accuracy the throttle sees.}
+The throttle uses the prefetcher's own filter counters, not ChampSim's accuracy. The two are very
+different (Table~\ref{tab:spp-deg-hist}). The filter counts a prefetch as useful whenever a later
+demand load touches that line, even if the line was already in the L1D and the prefetch was
+dropped. So the own accuracy (80--86\,\%) is much higher than ChampSim's (26--57\,\%). As a
+result, the throttle chooses degree 4 in most epochs and almost never degree 1. The thresholds
+therefore act on the own-accuracy scale. With 40/75, 75\,\% on this scale separates the regular
+phases (degree 4) from the noisier ones (degree 2). The lower threshold of 40\,\% is a safety net
+for phases where most prefetches are wrong, and such phases are rare in these traces.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{lrrrrr}
+        \toprule
+        Trace & Own accuracy (\%) & ChampSim accuracy (\%) & \multicolumn{3}{c}{Epochs at degree} \\
+        \cmidrule(lr){4-6}
+        & & & 1 & 2 & 4 \\
+        \midrule
+        Trace1-001 & 86.3 & 57.0 & 1 & 154 & 689 \\
+        Trace2-002 & 83.3 & 46.6 & 5 & 62  & 190 \\
+        Trace3-001 & 79.6 & 26.1 & 1 & 198 & 413 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Own (filter) accuracy, ChampSim accuracy and degree chosen per epoch for the final SPP
+             (40/75, degrees 1/2/4). Epochs include the warm-up phase.}
+    \label{tab:spp-deg-hist}
+\end{table}
 
 \paragraph{Choice of prefetch degrees.}
 The three levels are chosen to give the throttle a clear role for each accuracy region:
@@ -615,49 +680,247 @@ The three levels are chosen to give the throttle a clear role for each accuracy 
 \end{itemize}
 The degrees are in a $1:2:4$ ratio so that each step is clearly different from the next.
 
-\todo{support the choice of 1/2/4 with the fixed-degree sweep (degree 1,2,3,4,6,8 with throttling off), e.g.\ where IPC stops improving and accuracy drops}
-
-\subsubsection{Results}
-\todo{IPC, speedup, L1D load MPKI, accuracy, coverage: baseline vs IP-stride vs SPP}
+To check where the useful range of degrees ends, we also ran SPP with throttling disabled, using
+the same degree in every epoch (Table~\ref{tab:spp-fixed-deg}).
 
 \begin{table}[H]
     \centering
+    \small
+    \setlength{\tabcolsep}{3pt}
+    \begin{tabular}{l rrr r rrr rrr r}
+        \toprule
+        & \multicolumn{3}{c}{Speedup} & & \multicolumn{3}{c}{Coverage (\%)} & \multicolumn{3}{c}{Accuracy (\%)} & L1D pf \\
+        \cmidrule(lr){2-4}\cmidrule(lr){6-8}\cmidrule(lr){9-11}
+        Degree & T1 & T2 & T3 & Geomean & T1 & T2 & T3 & T1 & T2 & T3 & requests (T1) \\
+        \midrule
+        1 & 1.0032 & 1.0000 & 1.0023 & 1.0018 & 3.7 & 0.6 & 2.3 & 56.2 & 55.9 & 28.2 & 100\,003 \\
+        2 & 1.0039 & 0.9998 & 1.0032 & 1.0023 & 4.8 & 0.7 & 3.3 & 59.2 & 53.1 & 26.3 & 123\,343 \\
+        3 & 1.0041 & 0.9998 & 1.0037 & 1.0025 & 5.3 & 0.7 & 3.9 & 57.6 & 48.5 & 24.8 & 134\,486 \\
+        4 & 1.0042 & 0.9997 & 1.0039 & 1.0026 & 5.7 & 0.8 & 4.6 & 55.6 & 44.6 & 24.7 & 144\,342 \\
+        6 & 1.0036 & 0.9995 & 1.0037 & 1.0023 & 6.0 & 0.8 & 4.9 & 51.5 & 39.9 & 21.6 & 160\,979 \\
+        8 & 1.0032 & 0.9996 & 1.0034 & 1.0021 & 6.1 & 0.9 & 5.0 & 47.9 & 38.0 & 18.7 & 176\,682 \\
+        \midrule
+        \textbf{throttled 1/2/4} & \textbf{1.0042} & \textbf{0.9997} & \textbf{1.0038} & \textbf{1.0026} & 5.4 & 0.7 & 4.3 & 57.0 & 46.6 & 26.1 & 136\,716 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Fixed prefetch degree (throttling off) compared with the throttled SPP.}
+    \label{tab:spp-fixed-deg}
+\end{table}
+
+The fixed-degree sweep supports the three levels:
+\begin{itemize}
+    \item \textbf{Speedup peaks at degree 4.} It rises from degree 1 (1.0018) to degree 4 (1.0026)
+          and falls again at 6 and 8. Beyond degree 4 the extra prefetches still add a little coverage
+          (5.7\,\% $\to$ 6.1\,\% on Trace1), but accuracy keeps falling (55.6\,\% $\to$ 47.9\,\%) and
+          the wasted prefetches cost more than the new hits gain. Degree 4 is therefore the right
+          maximum.
+    \item \textbf{Accuracy falls with every step of degree.} Lines further along the predicted
+          sequence are less certain. This is why a low-accuracy phase should drop to degree 1:
+          it has the highest accuracy on Trace2 and Trace3 and the fewest requests.
+    \item \textbf{The throttled 1/2/4 setting matches the best fixed degree with fewer
+          prefetches.} It has the same geometric-mean speedup as fixed degree 4 (1.0026), with 1--2
+          points higher accuracy on every trace and 5\,\% fewer L1D prefetch requests on Trace1
+          (136\,716 vs.\ 144\,342). The 1/3/6 and 2/4/8 sets (Table~\ref{tab:spp-thr-sweep})
+          go past degree 4 in good phases and are slightly worse, which agrees with the fixed-degree
+          results.
+\end{itemize}
+
+\subsubsection{Results}
+\label{sec:task1b-results}
+All runs use the same setup as Task 1A: 25M warm-up and 25M simulated instructions, LRU at the
+L2C, and the same definitions of speedup, coverage and accuracy (Section~\ref{sec:task1a}). SPP
+uses the final parameters of Section~\ref{sec:task1b}: 24 trackers with 8-bit IP tags, a history of
+3 strides, uniform threshold 2 with miss penalty 1, signature confidence $\ge 1$, and throttling
+with 40/75 and degrees 1/2/4. Table~\ref{tab:task1-main} gives the main metrics. The
+geometric-mean speedup over the three traces is 1.0021 for IP-stride and 1.0026 for SPP.
+
+\begin{table}[H]
+    \centering
+    \small
     \begin{tabular}{llrrrrr}
         \toprule
         Trace & Prefetcher & IPC & Speedup & L1D load MPKI & Accuracy (\%) & Coverage (\%) \\
         \midrule
-        \todo{} & & & & & & \\
+        Trace1-001 & Baseline  & 0.2323 & 1.0000 & 10.68 & --   & --  \\
+                   & IP-stride & 0.2333 & \textbf{1.0045} & 10.12 & 53.0 & 5.3 \\
+                   & SPP       & 0.2333 & 1.0042 & \textbf{10.10} & \textbf{57.0} & \textbf{5.4} \\
+        \midrule
+        Trace2-002 & Baseline  & 0.2506 & 1.0000 & 13.54 & --   & --  \\
+                   & IP-stride & 0.2505 & 0.9995 & \textbf{13.44} & 38.2 & \textbf{0.7} \\
+                   & SPP       & 0.2506 & \textbf{0.9997} & \textbf{13.44} & \textbf{46.6} & \textbf{0.7} \\
+        \midrule
+        Trace3-001 & Baseline  & 0.3820 & 1.0000 & 3.40  & --   & --  \\
+                   & IP-stride & 0.3829 & 1.0023 & 3.32  & 16.0 & 2.5 \\
+                   & SPP       & 0.3835 & \textbf{1.0038} & \textbf{3.26} & \textbf{26.1} & \textbf{4.3} \\
         \bottomrule
     \end{tabular}
-    \caption{Task 1 results.}
+    \caption{Task 1 results: baseline (no L1D prefetcher), IP-stride and SPP. The best prefetcher
+    value per trace is in bold.}
+    \label{tab:task1-main}
+\end{table}
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{llrrrrrr}
+        \toprule
+        Trace & Prefetcher & Queued & Hit in L1D & Merged & To lower level & Useful & Late \\
+        \midrule
+        Trace1-001 & IP-stride & 155\,922 & 102\,542 & 12\,994 & 30\,956 & 16\,408 & 2\,807 \\
+                   & SPP       & 68\,498  & 37\,621  & 258     & 29\,211 & 16\,649 & 2\,998 \\
+        \midrule
+        Trace2-002 & IP-stride & 78\,701  & 57\,796  & 5\,750  & 11\,426 & 4\,361  & 272    \\
+                   & SPP       & 42\,488  & 33\,818  & 71      & 8\,259  & 3\,845  & 270    \\
+        \midrule
+        Trace3-001 & IP-stride & 103\,500 & 70\,396  & 6\,362  & 17\,007 & 2\,713  & 3\,067 \\
+                   & SPP       & 52\,599  & 33\,272  & 343     & 15\,807 & 4\,127  & 2\,647 \\
+        \bottomrule
+    \end{tabular}
+    \caption{L1D prefetch counters of IP-stride and SPP (columns as in Table~\ref{tab:task1a-pf};
+    ``Merged'' is the number of queued prefetches merged with a request already in the
+    prefetch queue).}
+    \label{tab:task1-pf}
+\end{table}
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{lrrr}
+        \toprule
+        Prefetcher & Trace1-001 & Trace2-002 & Trace3-001 \\
+        \midrule
+        Baseline  & 17.75 / 7.35 & 28.23 / 8.70 & 3.96 / 2.84 \\
+        IP-stride & 17.22 / 6.83 & 28.32 / 8.61 & 3.77 / 2.63 \\
+        SPP       & 17.19 / 6.81 & 28.30 / 8.62 & 3.71 / 2.57 \\
+        \bottomrule
+    \end{tabular}
+    \caption{L2C load MPKI / L2C data load MPKI. The L1D prefetchers also reduce data misses at
+    the L2C, because prefetches that are not timely still bring the line closer.}
+    \label{tab:task1-l2c}
 \end{table}
 
 \begin{figure}[H]
     \centering
-    \todo{speedup plot}
-    \caption{Speedup over the no-prefetching baseline.}
+    \includegraphics[width=0.78\textwidth]{../results/task1/plots/speedup.png}
+    \caption{Speedup over the no-prefetching baseline (axis zoomed around 1.0).}
+    \label{fig:task1-speedup}
 \end{figure}
 
 \begin{figure}[H]
     \centering
-    \todo{L1D load MPKI plot}
+    \includegraphics[width=0.78\textwidth]{../results/task1/plots/mpki.png}
     \caption{L1D load MPKI.}
+    \label{fig:task1-mpki}
 \end{figure}
 
 \begin{figure}[H]
     \centering
-    \todo{accuracy plot}
-    \caption{L1D prefetch accuracy.}
+    \includegraphics[width=0.78\textwidth]{../results/task1/plots/accuracy.png}
+    \caption{L1D prefetch accuracy (ChampSim definition).}
+    \label{fig:task1-acc}
 \end{figure}
 
 \begin{figure}[H]
     \centering
-    \todo{coverage plot}
-    \caption{L1D prefetch coverage.}
+    \includegraphics[width=0.78\textwidth]{../results/task1/plots/coverage.png}
+    \caption{L1D prefetch coverage (reduction of L1D load misses relative to the baseline).}
+    \label{fig:task1-cov}
 \end{figure}
+
+\paragraph{Observations.}
+\begin{itemize}
+    \item \textbf{SPP is more accurate on every trace}: $57.0\%$, $46.6\%$ and $26.1\%$ against
+          $53.0\%$, $38.2\%$ and $16.0\%$ for IP-stride.
+    \item \textbf{SPP reaches the same or higher coverage with about half the prefetches.} It queues
+          56\%, 46\% and 49\% fewer prefetches than IP-stride, but its coverage is the same on Trace1
+          and Trace2 and much higher on Trace3 ($4.3\%$ against $2.5\%$). On Trace3 it removes $3\,648$
+          L1D load misses against $2\,110$ for IP-stride, and it has 52\% more useful prefetches
+          ($4\,127$ against $2\,713$).
+    \item \textbf{Far fewer redundant prefetches.} Only $258$, $71$ and $343$ prefetches are merged
+          in the queue, against $12\,994$, $5\,750$ and $6\,362$ for IP-stride, because the prefetch
+          filter drops candidates that were requested recently. The share of queued prefetches that
+          find the line already in the L1D also falls (from 80\% to 61\% on Trace1).
+    \item \textbf{Speedup is still small.} The best case is $1.0042$ on Trace1 and $1.0038$ on
+          Trace3. On Trace1, IP-stride is ahead by $0.0003$ even though SPP has slightly higher
+          coverage and accuracy. SPP has a few more late prefetches there ($2\,998$ against $2\,807$),
+          but a difference this small should not be read as a real advantage of either prefetcher.
+    \item \textbf{Trace2 does not benefit from either prefetcher}: both change IPC by less than
+          0.05\% and remove under 1\% of its L1D load misses.
+\end{itemize}
 
 \subsubsection{Discussion}
-\todo{where SPP wins or loses against IP-stride, and why}
+\paragraph{Where SPP wins against IP-stride, and why.}
+\begin{itemize}
+    \item \textbf{Irregular but repeating strides (Trace3).} IP-stride only prefetches when the
+          same stride appears twice in a row. SPP's signature table also learns strides that follow
+          a repeating pattern. On Trace3 39\% of SPP's prefetches come from the pattern path, and this
+          is the trace where SPP gains most: coverage $2.5\% \to 4.3\%$, accuracy
+          $16.0\% \to 26.1\%$ and speedup $1.0023 \to 1.0038$.
+    \item \textbf{Tolerance to single wrong strides.} IP-stride replaces its stride after every
+          mismatch, so one irregular access stops its prefetching until the stride repeats again.
+          SPP's confidence counter only loses one step, so a stream with occasional noise keeps being
+          prefetched.
+    \item \textbf{Throttling and filtering.} The filter and the degree throttle cut the number of
+          queued prefetches roughly in half without losing coverage. This saves L1D tag lookups,
+          prefetch-queue slots and L2 bandwidth, which IP-stride (fixed degree 3) spends on lines
+          that are already present.
+\end{itemize}
+
+\paragraph{Where SPP does not win, and why.}
+\begin{itemize}
+    \item \textbf{Constant-stride streams (Trace1).} For streams that IP-stride already handles,
+          SPP can only match it. Both reach about $5.4\%$ coverage, and the speedup difference
+          ($0.0003$) is within the noise of these runs.
+    \item \textbf{Misses that are not stride-predictable (Trace2).} No variant we tried moved
+          Trace2 above $0.7\%$ coverage. Its misses come from IPs whose consecutive addresses have no
+          stable stride or short stride pattern, which a per-IP stride prefetcher cannot predict.
+\end{itemize}
+
+\paragraph{Why the speedups are small for both prefetchers.}
+\begin{itemize}
+    \item \textbf{The traces are front-end bound.} The baseline L1I MPKI is $14.5$, $40.0$ and
+          $2.1$, and the branch MPKI is $16.1$, $6.3$ and $7.2$. Trace1 and Trace2 spend much of their
+          time waiting for instructions or recovering from mispredictions, so removing a few
+          percent of the data misses changes the IPC very little. Trace3 has few misses of any
+          kind (L1D load MPKI $3.4$), so there is little left to remove.
+    \item \textbf{Only a small part of the misses is stride-predictable.} An offline analysis of
+          the load streams showed that only about 6--12\% of the loads can be predicted by a per-IP
+          uniform or signature scheme even with unlimited tables, which bounds the coverage of both
+          prefetchers.
+    \item \textbf{A small tracker table.} Each trace has $73$k--$170$k distinct load IPs, and
+          24 trackers hold the IP of only about one load in five. An earlier experiment with the
+          initial SPP parameters showed that a larger table helps: 128 trackers gave speedups of
+          1.004/1.002/1.005, and 512 trackers 1.006/1.007/1.015. But 512 trackers need about
+          23\,KB, against 1.1\,KB for the final design. We kept 24 trackers to stay lightweight
+          and to compare with IP-stride at the same number of entries.
+\end{itemize}
+
+\paragraph{How the parameters were tuned.}
+The first version of SPP used a 5-stride history, a uniform threshold of 3 with miss penalty 2,
+signature confidence $\ge 2$ and 12-bit IP tags. It was more conservative than IP-stride and had
+\emph{lower} coverage. Table~\ref{tab:spp-tuning} shows how each change moved the results. The
+main reason for the low initial coverage was the long training time: with short strided runs,
+SPP was often still learning when the run ended. A shorter history and lower thresholds fix this
+at a small cost in accuracy, and 8-bit IP tags slightly increase coverage while saving 96 bits.
+
+\begin{table}[H]
+    \centering
+    \small
+    \setlength{\tabcolsep}{3pt}
+    \begin{tabular}{l rrr rrr rrr r}
+        \toprule
+        & \multicolumn{3}{c}{Speedup} & \multicolumn{3}{c}{Coverage (\%)} & \multicolumn{3}{c}{Accuracy (\%)} & Storage \\
+        \cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(lr){8-10}
+        Version & T1 & T2 & T3 & T1 & T2 & T3 & T1 & T2 & T3 & (bits) \\
+        \midrule
+        Initial (history 5, thr.\ 3, pen.\ 2, sig.\ $\ge 2$) & 1.003 & 1.000 & 1.002 & 3.6 & 0.6 & 2.3 & 59.2 & 60.9 & 33.4 & 9\,468 \\
+        + history 3, thr.\ 2, pen.\ 1        & 1.004 & 1.000 & 1.002 & 4.9 & 0.6 & 2.5 & 58.6 & 53.3 & 21.9 & 9\,132 \\
+        + signature confidence $\ge 1$        & 1.004 & 1.000 & 1.004 & 5.3 & 0.7 & 4.2 & 56.9 & 48.8 & 25.9 & 9\,132 \\
+        + 8-bit IP tag (final)                & 1.004 & 1.000 & 1.004 & 5.4 & 0.7 & 4.3 & 57.0 & 46.6 & 26.1 & 9\,036 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Effect of the parameter changes; each row adds one change to the previous row.}
+    \label{tab:spp-tuning}
+\end{table}
+
 
 % ================================================================= TASK 2
 \section{Task 2: Cache Replacement Policy}
