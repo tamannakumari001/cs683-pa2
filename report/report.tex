@@ -18,6 +18,8 @@
 \usepackage{needspace}
 \usepackage{etoolbox}
 \usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,shapes.geometric,fit,calc}
 \usepackage[hidelinks]{hyperref}
 
 \graphicspath{{../results/}}
@@ -353,10 +355,170 @@ These results are the reference point for the SPP evaluation.
 \label{sec:task1b}
 
 \subsubsection{Design}
-\todo{prefetching table, uniform/non-uniform classification, signature, fallback, degree, page limit}
+The SPP prefetcher keeps the per-IP organisation of the IP-stride prefetcher, but every IP entry
+holds two predictors instead of one: a cheap \emph{uniform} predictor for constant strides and a
+small \emph{signature table} for strides that follow a repeating pattern. A confidence counter in each
+predictor is raised on correct predictions and lowered on wrong ones, so a single irregular access
+no longer destroys what was learned. On top of this, a small prefetch filter measures how many
+prefetches are useful, and the prefetch degree is throttled from that measurement.
+
+\paragraph{Overview.}
+Figure~\ref{fig:spp-overview} shows the structures. Only demand loads (\texttt{type == LOAD}) are
+used for training and prediction. Strides are always measured in cache lines.
+
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[
+        font=\small,
+        box/.style={draw, rounded corners=2pt, align=center, fill=blue!6, minimum height=8mm},
+        cell/.style={draw, align=center, fill=white, font=\footnotesize, minimum height=6mm},
+        arr/.style={-{Stealth[length=2mm]}, thick}]
+        % input
+        \node[box, minimum width=30mm] (ld) at (0,0) {demand load\\ (addr, IP)};
+        \node[box, minimum width=30mm] (idx) at (0,-2.4) {8-bit IP tag\\ match 24 trackers};
+        \draw[arr] (ld)--(idx);
+        % tracker frame
+        \node[draw, rounded corners=3pt, fill=green!5, minimum width=108mm, minimum height=46mm, anchor=north west] (trk) at (2.6,1.2) {};
+        \node[anchor=north west, font=\small\bfseries] at ($(trk.north west)+(2mm,-1mm)$) {IP tracker (one of 24)};
+        % left column
+        \node[cell, minimum width=46mm, anchor=north west] (c1) at ($(trk.north west)+(3mm,-9mm)$) {\texttt{ip\_tag}, \texttt{last\_line}, LRU rank};
+        \node[cell, minimum width=46mm, fill=orange!15, anchor=north west] (c2) at ($(c1.south west)+(0,-2mm)$) {\texttt{uni\_stride}, \texttt{uni\_conf} (2 b)};
+        \node[cell, minimum width=46mm, fill=orange!15, anchor=north west] (c3) at ($(c2.south west)+(0,-2mm)$) {\texttt{hist[0..2]}: last 3 strides};
+        % right: signature table
+        \node[font=\footnotesize\bfseries, anchor=north west] (st) at ($(trk.north west)+(58mm,-9mm)$) {signature table (4 sets $\times$ 4 ways)};
+        \foreach \i in {0,1,2,3} {
+            \node[cell, fill=yellow!20, minimum width=46mm, anchor=north west] (s\i) at ($(st.south west)+(0,-1mm-\i*6.8mm)$) {set \i:\ tag(6) | next(7) | conf(2)};
+        }
+        \draw[arr] (c3.east) -- node[above, font=\scriptsize]{hash} ($(c3.east)+(8mm,0)$) |- (s3.west);
+        % bottom blocks inside frame
+        \node[box, fill=red!8, minimum width=46mm, anchor=north west] (flt) at ($(trk.south west)+(0,-8mm)$) {prefetch filter (global)\\ 64 $\times$ (valid, 12-bit tag)};
+        \node[box, fill=red!8, minimum width=46mm, anchor=north west] (thr) at ($(trk.south west)+(58mm,-8mm)$) {throttle (global): \texttt{issued},\\ \texttt{useful}, \texttt{degree}};
+        \draw[arr] (flt)--node[above, font=\scriptsize]{useful}(thr);
+        \draw[arr] (thr.north)--node[right, font=\scriptsize]{degree}(thr.north |- trk.south);
+        \draw[arr] (idx.east)--(trk.west |- idx.east);
+    \end{tikzpicture}
+    \caption{Structures of the SPP prefetcher.}
+    \label{fig:spp-overview}
+\end{figure}
+
+\paragraph{IP tracker.}
+Like IP-stride, the trackers are a plain array of 24 entries, indexed by an 8-bit IP tag and
+replaced in LRU order. Besides the IP tag and the last accessed cache line, each tracker holds:
+\begin{itemize}
+    \item a \textbf{uniform predictor}: a stride \texttt{uni\_stride} and a 2-bit confidence
+          \texttt{uni\_conf};
+    \item a \textbf{stride history} \texttt{hist[3]} with the last three strides of this IP;
+    \item a private \textbf{signature table} of 4 sets $\times$ 4 ways. Each entry holds a 6-bit tag,
+          the stride that followed the signature (\texttt{next}, 7 bits signed) and a 2-bit
+          confidence. A confidence of 0 marks an invalid entry.
+\end{itemize}
+The \emph{signature} of an IP is the hash of its three-stride history (FNV-style mix of the three
+strides); two bits of it select the set and six bits form the tag. A signature therefore stands for
+``the last three strides were $a,b,c$'' and the table learns which stride $d$ usually comes next.
+
+\paragraph{Training.}
+On every demand load of a known IP the stride $s = \text{line} - \texttt{last\_line}$ is computed.
+A stride of 0 (same line) is ignored. A stride larger than $\pm 63$ lines is treated as a jump: the
+uniform predictor and the history are cleared and no learning takes place. Otherwise both
+predictors are trained:
+\begin{itemize}
+    \item \textbf{Uniform predictor.} If $s = \texttt{uni\_stride}$, \texttt{uni\_conf} is
+          increased (saturating at 3). Otherwise it is decreased by 1 (the miss penalty), and only
+          once it has reached 0 is \texttt{uni\_stride} replaced by $s$. A constant-stride stream
+          therefore needs three accesses to reach the usable confidence of 2, but one stray
+          stride only costs one confidence step instead of the whole entry.
+    \item \textbf{Signature table.} The signature of the \emph{old} history is looked up. On a hit
+          whose \texttt{next} equals $s$ the confidence is increased (saturating at 3), otherwise it
+          is decreased and the entry is cleared when it reaches 0. On a miss the weakest way of the
+          set is chosen: if its confidence is 0 it is replaced by a new entry with
+          $(\text{tag}, s, 1)$, otherwise its confidence is only decreased. Stale or strong entries
+          are thus replaced gradually and not at the first conflict.
+\end{itemize}
+Finally $s$ is shifted into \texttt{hist} and \texttt{last\_line} is updated.
+
+\paragraph{Uniform / non-uniform classification and fallback.}
+An IP is classified as \emph{uniform} when $\texttt{uni\_conf} \ge 2$, i.e.\ its recent strides have
+mostly been the same. Otherwise it is \emph{non-uniform} and the signature table is used. This is
+a fallback chain (Figure~\ref{fig:spp-flow}): constant strides are handled by the cheap
+uniform predictor, which needs no history, and only IPs that are not uniform are handed to the
+signature table, which can also follow alternating or otherwise periodic strides. If the
+signature table has no confident entry for the current history, nothing is prefetched.
+
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[
+        font=\footnotesize,
+        proc/.style={draw, rounded corners=2pt, fill=blue!6, minimum width=36mm, minimum height=7mm, align=center},
+        dec/.style={draw, diamond, aspect=2.6, fill=yellow!15, inner sep=1pt, align=center},
+        end/.style={draw, rounded corners=6pt, fill=green!8, minimum height=7mm, align=center},
+        arr/.style={-{Stealth[length=2mm]}, thick},
+        node distance=6mm]
+        \node[proc] (a) {demand load $\to$ find tracker\\ compute stride $s$};
+        \node[dec, below=of a] (d1) {$s=0$ or\\ $|s|>63$?};
+        \node[end, right=14mm of d1] (skip) {ignore / reset, no prefetch};
+        \node[proc, below=of d1] (tr) {train uniform predictor\\ and signature table};
+        \node[dec, below=of tr] (d2) {\texttt{uni\_conf}\\ $\ge 2$?};
+        \node[proc, below left=7mm and 8mm of d2, fill=orange!15] (u) {\textbf{uniform mode}\\ $\text{line}+d\cdot\texttt{uni\_stride}$,\\ $d=1..\text{degree}$};
+        \node[proc, below right=7mm and 8mm of d2, fill=orange!15] (p) {\textbf{pattern mode}\\ look up signature, take \texttt{next},\\ shift into temporary history,\\ repeat up to degree};
+        \node[dec, below=14mm of $(u)!0.5!(p)$] (d3) {candidate in\\ same 4\,KB page\\ and not in filter?};
+        \node[end, below=of d3] (iss) {prefetch (L1 or L2 fill)};
+        \node[end, right=14mm of d3] (stop) {stop this access};
+        \draw[arr] (a)--(d1);
+        \draw[arr] (d1)--node[right]{no}(tr);
+        \draw[arr] (d1)--node[above]{yes}(skip);
+        \draw[arr] (tr)--(d2);
+        \draw[arr] (d2)-|node[above, pos=0.2]{yes}(u);
+        \draw[arr] (d2)-|node[above, pos=0.2]{no}(p);
+        \draw[arr] (u)|-(d3.west);
+        \draw[arr] (p)|-(d3.east);
+        \draw[arr] (d3)--node[right]{yes}(iss);
+        \draw[arr] (d3)--node[above]{no}(stop);
+    \end{tikzpicture}
+    \caption{Decision flow of the SPP prefetcher for one demand load.}
+    \label{fig:spp-flow}
+\end{figure}
+
+\paragraph{Prefetch generation, degree and page limit.}
+In uniform mode up to \texttt{degree} lines $\text{line} + d\cdot\texttt{uni\_stride}$ are requested.
+In pattern mode the predictor walks ahead: it looks up the signature of the current history, takes
+the predicted \texttt{next} stride, adds it to the running line address, shifts it into a temporary
+copy of the history and repeats, so the lookahead follows the learned pattern step by step and stops
+as soon as there is no entry of confidence $\ge 1$. Every candidate must stay inside the
+\textbf{same 4\,KB page} as the demand access, since the next physical page is unknown; the first
+candidate that crosses the page ends the walk. The fill level depends on the miss-handling pressure:
+a prefetch fills the L1D when fewer than half of the MSHRs are occupied, and otherwise only
+the L2C, so prefetches do not starve demand misses.
+
+\paragraph{Prefetch filter and usefulness tracking.}
+Each issued prefetch is recorded in a 64-entry direct-mapped filter (valid bit and 12-bit tag).
+It has two roles. First, a candidate already present in the filter is not requested again
+(duplicate suppression). Second, when a later demand load hits a line recorded in the filter,
+that prefetch is counted as \emph{useful} and the entry is cleared. This gives the prefetcher
+its own accuracy, $\text{useful}/\text{issued}$, independent of ChampSim's counters.
+
+\paragraph{Accuracy-based throttling.}
+Issued and useful prefetches are counted over an epoch of 256 issued prefetches. At the end
+of an epoch the accuracy is computed and the degree for the next epoch is chosen from three
+levels: a low degree (1) if accuracy is below 40\,\%, a high degree (4) if it is above 75\,\%, and a middle degree (2)
+otherwise; the counters are then reset. Thus the prefetcher is aggressive when its predictions
+are good and falls back when they are mostly wrong, which limits cache pollution and wasted
+bandwidth. The choice of the thresholds and degrees is discussed in
+Section~\ref{sec:throttling}.
+
+\paragraph{Example.}
+Consider an IP with the stride sequence $+1,+3,+1,+3,\dots$, which IP-stride can never prefetch.
+Its uniform predictor keeps being contradicted, so \texttt{uni\_conf} stays below 2 and the IP is
+non-uniform. The signature table, however, learns the two entries
+$(+1,+3,+1)\!\to\!+3$ and $(+3,+1,+3)\!\to\!+1$; after a few repetitions their confidence is
+$\ge 1$ and, from the current history, SPP prefetches
+$+3,+1,+3,\dots$ lines ahead, up to the degree. A single irregular stride in a constant stream
+only lowers \texttt{uni\_conf} by one, so the stream remains classified as uniform and keeps being
+prefetched.
 
 \subsubsection{Storage overhead}
-\todo{exact bit-level breakdown of every table entry and the total}
+The storage is counted bit-exactly with the logical field widths of the hardware, not the C++
+type sizes. Strides are 7-bit signed values (range $\pm 63$) and a line address is
+$64-6=58$ bits. Table~\ref{tab:spp-storage} lists every field.
 
 \begin{table}[H]
     \centering
@@ -364,18 +526,96 @@ These results are the reference point for the SPP evaluation.
         \toprule
         Table & Field & Bits per entry & Entries & Total bits \\
         \midrule
-        \todo{} & & & & \\
+        \multicolumn{5}{l}{\textit{Signature entry (inside every tracker)}} \\
+        & tag                           & 6  &    &    \\
+        & \texttt{next} stride          & 7  &    &    \\
+        & confidence                    & 2  &    &    \\
+        & \textbf{entry total}          & \textbf{15} & 16 per tracker & 240 per tracker \\
+        \midrule
+        \multicolumn{5}{l}{\textit{IP tracker}} \\
+        & IP tag                        & 8  &    &    \\
+        & \texttt{last\_line}           & 58 &    &    \\
+        & \texttt{uni\_stride}          & 7  &    &    \\
+        & \texttt{uni\_conf}            & 2  &    &    \\
+        & \texttt{hist[3]} (3 $\times$ 7) & 21 &  &    \\
+        & LRU rank                      & 5  &    &    \\
+        & signature table (16 $\times$ 15) & 240 & & \\
+        & \textbf{tracker total}        & \textbf{341} & 24 & \textbf{8184} \\
+        \midrule
+        \multicolumn{5}{l}{\textit{Prefetch filter}} \\
+        & valid bit                     & 1  &    &    \\
+        & tag                           & 12 &    &    \\
+        & \textbf{entry total}          & \textbf{13} & 64 & \textbf{832} \\
+        \midrule
+        \multicolumn{5}{l}{\textit{Throttle control}} \\
+        & \texttt{epoch\_issued} (0--256) & 9 &   &    \\
+        & \texttt{epoch\_useful} (0--256) & 9 &   &    \\
+        & degree (3 levels)             & 2  &    &    \\
+        & \textbf{total}                & \textbf{20} & 1 & \textbf{20} \\
+        \midrule
+        \multicolumn{4}{l}{\textbf{Total SPP storage}} & \textbf{9036 bits} \\
+        \multicolumn{4}{l}{} & \textbf{(1129.5 bytes $\approx$ 1.10\,KB)} \\
         \bottomrule
     \end{tabular}
     \caption{Storage overhead of SPP.}
+    \label{tab:spp-storage}
 \end{table}
 
+The trackers dominate the cost: $24 \times 341 = 8184$ bits, i.e.\ 90.6\,\% of the total, and
+about 70\,\% of each tracker is its private signature table ($240$ of $341$ bits). The filter adds 832
+bits and the control state only 20 bits. The statistics counters (\texttt{tot\_issued} etc.) are
+only used for the final printout, are not part of the prefetcher logic, and are not counted. The
+same breakdown is printed by \texttt{l1d\_prefetcher\_final\_stats} at the end of each run.
+
 \subsubsection{Accuracy-based throttling}
+\label{sec:throttling}
 \paragraph{Threshold selection.}
-\todo{what the accuracy thresholds are and how they were decided}
+The throttle works on epochs of $N=256$ issued prefetches. At the end of an epoch the accuracy is
+$\text{acc} = 100\cdot\text{useful}/\text{issued}$ (integer percent), computed from the prefetcher's own
+filter counters (Section~\ref{sec:task1b}), and the degree for the next epoch is
+\[
+\text{degree} =
+\begin{cases}
+1 & \text{acc} < T_{\text{low}} = 40\,\%,\\
+4 & \text{acc} > T_{\text{high}} = 75\,\%,\\
+2 & \text{otherwise.}
+\end{cases}
+\]
+The counters are reset after every epoch, so the decision always reflects only the most recent 256
+prefetches. The epoch is counted in issued prefetches rather than in cycles or accesses, so the
+accuracy estimate always has the same sample size, and 256 is large enough that one noisy
+prefetch moves the estimate by less than 0.4 percentage points.
+
+The two thresholds split the accuracy range into three regions with a different cost of a wrong
+prefetch. Below 40\,\% most prefetches are wasted, and each
+wrong prefetch occupies an MSHR and L2/L1 bandwidth and can evict a useful line, so the prefetcher
+is throttled to the minimum. Above 75\,\% at least three of four prefetches are used, so going
+deeper is worth it. In between the effect of the degree is unclear and a moderate value is kept.
+The measured accuracy of IP-stride on our traces (53\,\%, 38\,\% and 16\,\%, Table~\ref{tab:task1a-main})
+also lies around and below the lower threshold, which shows that a low-accuracy region needs to be
+handled explicitly.
+
+\todo{how the thresholds were decided: add the fixed-degree sweep and the $(T_{\text{low}},T_{\text{high}})$ sweep (IPC, accuracy, coverage per setting) and state that 40/75 gave the best geometric-mean speedup}
 
 \paragraph{Choice of prefetch degrees.}
-\todo{why these degrees for the different accuracy ranges}
+The three levels are chosen to give the throttle a clear role for each accuracy region:
+\begin{itemize}
+    \item \textbf{Degree 1 (accuracy $<40\,\%$).} The lowest degree that still keeps the prefetcher
+          running. It prefetches only the next predicted line, the one with the highest confidence,
+          so the cost of wrong predictions is minimal, while the prefetcher can still recover when
+          the program enters a regular phase. The prefetcher is not switched off completely, because
+          then no new usefulness would be measured and the degree could never rise again.
+    \item \textbf{Degree 2 (between 40\,\% and 75\,\%).} The default and the start value. It hides
+          more latency than degree 1 while limiting the waste if some predictions are wrong.
+    \item \textbf{Degree 4 (accuracy $>75\,\%$).} For regular streams, where the lines farther
+          ahead are almost always used. A deeper lookahead is needed to be timely, since the
+          prefetch has to complete before the demand access arrives. Four is the maximum, because
+          it is kept within the page limit (a 4\,KB page has only 64 lines) and because a large
+          degree raises the pressure on the MSHRs and the prefetch filter (64 entries).
+\end{itemize}
+The degrees are in a $1:2:4$ ratio so that each step is clearly different from the next.
+
+\todo{support the choice of 1/2/4 with the fixed-degree sweep (degree 1,2,3,4,6,8 with throttling off), e.g.\ where IPC stops improving and accuracy drops}
 
 \subsubsection{Results}
 \todo{IPC, speedup, L1D load MPKI, accuracy, coverage: baseline vs IP-stride vs SPP}

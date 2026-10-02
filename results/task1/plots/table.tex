@@ -1,0 +1,15 @@
+\begin{tabular}{llrrrrrr}
+\toprule
+Config & Trace & IPC & Speedup & L1D MPKI & L2C MPKI & Acc (\%) & Cov (\%) \\
+\midrule
+Baseline & Trace1-001 & 0.232 & 1.000 & 10.68 & 17.75 & -- & 0.0 \\
+Baseline & Trace2-002 & 0.251 & 1.000 & 13.54 & 28.23 & -- & 0.0 \\
+Baseline & Trace3-001 & 0.382 & 1.000 & 3.40 & 3.96 & -- & 0.0 \\
+IP-stride & Trace1-001 & 0.233 & 1.004 & 10.12 & 17.22 & 53.0 & 5.3 \\
+IP-stride & Trace2-002 & 0.251 & 1.000 & 13.44 & 28.32 & 38.2 & 0.7 \\
+IP-stride & Trace3-001 & 0.383 & 1.002 & 3.32 & 3.77 & 16.0 & 2.5 \\
+SPP & Trace1-001 & 0.233 & 1.004 & 10.10 & 17.19 & 57.0 & 5.4 \\
+SPP & Trace2-002 & 0.251 & 1.000 & 13.44 & 28.30 & 46.6 & 0.7 \\
+SPP & Trace3-001 & 0.384 & 1.004 & 3.26 & 3.71 & 26.1 & 4.3 \\
+\bottomrule
+\end{tabular}

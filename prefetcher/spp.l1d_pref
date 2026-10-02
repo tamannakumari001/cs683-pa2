@@ -2,18 +2,18 @@
 
 
 #define IP_TRACKER_COUNT 24
-#define IP_TAG_BITS 12
-#define HIST_LEN 5
+#define IP_TAG_BITS 8
+#define HIST_LEN 3
 #define SIG_SET_BITS 2
 #define SIG_SETS (1 << SIG_SET_BITS)
 #define SIG_WAYS 4
 #define SIG_TABLE_SIZE (SIG_SETS * SIG_WAYS)
 #define SIG_TAG_BITS 6
 #define SIG_CONF_MAX 3
-#define SIG_CONF_MIN 2
+#define SIG_CONF_MIN 1
 #define UNI_CONF_MAX 3
-#define UNI_CONF_THRESH 3
-#define UNI_MISS_PENALTY 2
+#define UNI_CONF_THRESH 2
+#define UNI_MISS_PENALTY 1
 #define MAX_STRIDE 63
 #define STRIDE_BITS 7
 
