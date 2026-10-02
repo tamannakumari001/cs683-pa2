@@ -3,6 +3,105 @@
 
 #define IP_TRACKER_COUNT 24
 #define IP_TAG_BITS 12
+#define HIST_LEN 5
+#define SIG_SET_BITS 2
+#define SIG_SETS (1 << SIG_SET_BITS)
+#define SIG_WAYS 4
+#define SIG_TABLE_SIZE (SIG_SETS * SIG_WAYS)
+#define SIG_TAG_BITS 6
+#define SIG_CONF_MAX 3
+#define SIG_CONF_MIN 2
+#define UNI_CONF_MAX 3
+#define UNI_CONF_THRESH 3
+#define UNI_MISS_PENALTY 2
+#define MAX_STRIDE 63
+#define STRIDE_BITS 7
+
+#define PF_FILTER_BITS 6
+#define PF_FILTER_SIZE (1 << PF_FILTER_BITS)
+#define PF_FILTER_TAG_BITS 12
+#define EPOCH_ISSUED 256
+#define ACC_LOW 40
+#define ACC_HIGH 75
+#define DEG_LOW 1
+#define DEG_HIGH 4
+#define DEG_MID 2
+#define LINE_ADDR_BITS 58
+
+struct SIG_ENTRY{
+
+    uint8_t tag;
+    int8_t next;
+    uint8_t conf;
+};
+
+class IP_TRACKER{
+    public:
+        uint64_t ip_tag;
+        uint64_t last_line;
+        int8_t uni_stride;
+        uint8_t uni_conf;
+        int8_t hist[HIST_LEN];
+        uint32_t lru;
+        SIG_ENTRY sig[SIG_TABLE_SIZE];
+
+};
+
+struct PF_FILTER_ENTRY{
+    bool valid;
+    uint16_t tag;
+    uint8_t conf;
+};
+
+static IP_TRACKER trackers[IP_TRACKER_COUNT];
+static PF_FILTER_ENTRY pf_filter[PF_FILTER_SIZE];
+
+static uint32_t epoch_issued, epoch_useful;
+static uint32_t cur_degree;
+
+static uint64_t tot_issued, tot_useful, issued_pattern, issued_uniform;
+static uint64_t epochs, deg_hist[DEG_HIGH+1];
+
+static inline uint32_t sig_hash(const int8_t* h){
+    uint32_t x = 2166136261u;
+    for(int i = 0; i < HIST_LEN; i++){
+        x ^= (uint8_t)h[i];
+        x *= 16777619u;
+    }
+    return x ^ (x >> 15);
+}
+
+static inline uint32_t sig_set(uint32_t h){
+    return h & (SIG_SETS - 1);
+}
+
+static inline uint32_t sig_tag(uint32_t h){
+    return (h >> SIG_SET_BITS) & ((1u << SIG_TAG_BITS) - 1);
+}
+
+static SIG_ENTRY *sig_find(IP_TRACKER &t, uint32_t h){
+    SIG_ENTRY *set = &t.sig[sig_set(h) * SIG_WAYS];
+    for (int i = 0; i < SIG_WAYS; i++){
+        if (set[i].conf > 0 && set[i].tag == sig_tag(h)){
+            return &set[i];
+        }
+    }
+    return NULL;
+}
+
+static inline uint16_t pf_filter_tag(uint64_t addr){
+    return (addr >> PF_FILTER_BITS) & ((1u << PF_FILTER_TAG_BITS) - 1);
+}
+
+static void touch(int index){
+    for (int i = 0 ; i < IP_TRACKER_COUNT; i++){
+        if (trackers[i].lru < trackers[index].lru)trackers[i].lru++;}
+
+    trackers[index].lru = 0;
+    
+}
+
+static uint32_t ceil_log2(uint32_t v) { uint32_t b = 0; while ((1u << b) < v) b++; return b; }
 
 
 void CACHE::l1d_prefetcher_initialize() 
@@ -10,11 +109,155 @@ void CACHE::l1d_prefetcher_initialize()
     std::cout << "------------------------------------------------" << std::endl;
     std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
+
+    for (int i = 0 ; i < IP_TRACKER_COUNT;i++){
+        trackers[i].lru = i;
+    }
+    cur_degree = DEG_MID;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+    if (type != LOAD) return;
+
+    uint64_t cl = addr >> LOG2_BLOCK_SIZE;
+    uint64_t page = addr >> LOG2_PAGE_SIZE;
+
+    PF_FILTER_ENTRY &fe = pf_filter[cl & (PF_FILTER_SIZE - 1)];
+    if (fe.valid && fe.tag == pf_filter_tag(cl)){
+        fe.valid = false;
+        epoch_useful++;
+        tot_useful++;
+    }
+
+    uint64_t tag = ip & ((1ull << IP_TAG_BITS) - 1);
+    int index = -1;
+    for(int i = 0; i < IP_TRACKER_COUNT; i++){
+        if (trackers[i].ip_tag == tag){
+            index = i;
+            break;
+        }
+    }
+
+    if (index < 0){
+        for (int i = 0 ; i< IP_TRACKER_COUNT; i++){
+            if (trackers[i].lru == (IP_TRACKER_COUNT - 1)){
+                index = i;
+                break;
+            }
+        }
+        IP_TRACKER &t = trackers[index];
+        t.ip_tag = tag;
+        t.last_line = cl;
+        t.uni_stride = 0;
+        t.uni_conf = 0;
+        for (int i = 0; i < HIST_LEN; i++) t.hist[i] = 0;
+        for (int i = 0; i < SIG_TABLE_SIZE; i++) t.sig[i].conf = 0;
+        touch(index);
+        return;
+    }
+
+    IP_TRACKER &t = trackers[index];
+    int64_t stride = (int64_t)cl - (int64_t)t.last_line;
+    if (stride == 0) {touch(index); return;}
+    if (stride > MAX_STRIDE || stride < -MAX_STRIDE) {
+        t.last_line = cl;
+        t.uni_stride = 0;
+        t.uni_conf = 0;
+        for (int i = 0; i < HIST_LEN; i++) t.hist[i] = 0;
+        touch(index);
+        return;
+    }
+
+    int8_t s = (int8_t)stride;
+
+    //training the uniform predictor
+    if (s == t.uni_stride){
+        if (t.uni_conf < UNI_CONF_MAX) t.uni_conf++;
+    } else {
+        t.uni_conf = (t.uni_conf > UNI_MISS_PENALTY) ? t.uni_conf - UNI_MISS_PENALTY : 0;
+        if (t.uni_conf == 0){
+            t.uni_stride = s;
+        }
+    }
+
+    //training the signature table
+
+    uint32_t h = sig_hash(t.hist);  
+    SIG_ENTRY *e = sig_find(t, h);
+    if (e){
+        if (e->next == s){
+            if (e->conf < SIG_CONF_MAX) e->conf++;
+        } else if (--e->conf == 0){
+            e->next = 0;
+        }
+    }
+    else{
+        SIG_ENTRY *set = &t.sig[sig_set(h) * SIG_WAYS];
+        SIG_ENTRY* weakest = &set[0];
+        for (int i = 1; i < SIG_WAYS; i++){
+            if (set[i].conf < weakest->conf) weakest = &set[i];
+        }
+        if (weakest -> conf == 0){
+            weakest -> tag = sig_tag(h);
+            weakest -> next = s;
+            weakest -> conf = 1;
+            }
+        else weakest -> conf--;
+    }
+
+    for (int i=0; i<HIST_LEN-1; i++) t.hist[i] = t.hist[i+1];
+    t.hist[HIST_LEN-1] = s;
+    t.last_line = cl;
+    touch(index);
+
+    bool uniform_mode = (t.uni_conf >= UNI_CONF_THRESH);
+    auto issue = [&](uint64_t pf_line) -> bool{
+        if ((pf_line >> (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE)) != page) return false;
+        PF_FILTER_ENTRY &f = pf_filter[pf_line & (PF_FILTER_SIZE - 1)];
+        if (f.valid && f.tag == pf_filter_tag(pf_line))
+            return true;
+        int fill = (MSHR.occupancy < (MSHR.SIZE>>1)) ? FILL_L1 : FILL_L2;
+        if (!prefetch_line(ip, addr, pf_line << LOG2_BLOCK_SIZE, fill, 0)) return false;
+        f.valid = true; f.tag = pf_filter_tag(pf_line);
+        epoch_issued++; tot_issued++;
+        if (uniform_mode) issued_uniform++;
+        else issued_pattern++;
+        return true;
+        
+    };
+
+    if (uniform_mode){
+        for (uint32_t d = 1; d <= cur_degree;d++){
+            if (!issue((uint64_t)((int64_t)cl + (int64_t)((int64_t)t.uni_stride * d)))) break;
+        }
+    }
+    else{
+        int8_t tmp[HIST_LEN];
+        for(int i = 0 ; i < HIST_LEN; i++) tmp[i] = t.hist[i];
+        uint64_t cursor = cl;
+        for (uint32_t d = 0 ; d < cur_degree;d++){
+            const SIG_ENTRY *e = sig_find(t, sig_hash(tmp));
+            if (!e || e -> conf < SIG_CONF_MIN) break;
+            cursor = (uint64_t)((int64_t)cursor + e -> next);
+            if (!issue(cursor)) break;
+            for (int i = 0; i < HIST_LEN-1; i++) tmp[i] = tmp[i+1];
+            tmp[HIST_LEN-1] = e -> next;
+        }
+    }
+
+    if (epoch_issued >= EPOCH_ISSUED){
+        uint32_t acc = (epoch_useful * 100) / epoch_issued;
+        cur_degree = (acc < ACC_LOW) ? DEG_LOW : (acc > ACC_HIGH) ? DEG_HIGH : DEG_MID;
+        deg_hist[cur_degree]++;
+        epochs++;
+        epoch_issued = 0;
+        epoch_useful = 0;
+    }
+
+    
+
+
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
@@ -24,5 +267,23 @@ void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t s
 
 void CACHE::l1d_prefetcher_final_stats()
 {
+    cout << "CPU " << cpu << " L1D SPP final stats" << endl;
+    cout << "SPP issued: " << tot_issued << " (uniform " << issued_uniform << ", pattern "
+         << issued_pattern << ")" << endl;
+    cout << "SPP useful (own filter): " << tot_useful << "  accuracy: "
+         << (tot_issued ? 100.0 * tot_useful / tot_issued : 0.0) << "%" << endl;
+    cout << "SPP epochs: " << epochs << "  degree chosen LOW/MID/HIGH epochs: "
+         << deg_hist[DEG_LOW] << "/" << deg_hist[DEG_MID] << "/" << deg_hist[DEG_HIGH] << endl;
 
+    // storage overhead, bit-exact (logical field widths, not C++ type sizes)
+    uint32_t sig_bits = SIG_TAG_BITS + STRIDE_BITS + ceil_log2(SIG_CONF_MAX + 1);
+    uint32_t trk_bits = IP_TAG_BITS + LINE_ADDR_BITS + STRIDE_BITS + ceil_log2(UNI_CONF_MAX + 1)
+                      + HIST_LEN * STRIDE_BITS + ceil_log2(IP_TRACKER_COUNT)
+                      + SIG_TABLE_SIZE * sig_bits;
+    uint32_t flt_bits = PF_FILTER_SIZE * (1 + PF_FILTER_TAG_BITS);
+    uint32_t ctl_bits = 2 * ceil_log2(EPOCH_ISSUED + 1) + 2;
+    uint32_t total = IP_TRACKER_COUNT * trk_bits + flt_bits + ctl_bits;
+    cout << "SPP storage: signature entry " << sig_bits << " b, tracker " << trk_bits << " b x "
+         << IP_TRACKER_COUNT << ", filter " << flt_bits << " b, control " << ctl_bits
+         << " b  => total " << total << " bits (" << total / 8.0 << " bytes)" << endl;
 }
