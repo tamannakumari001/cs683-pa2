@@ -922,7 +922,7 @@ at a small cost in accuracy, and 8-bit IP tags slightly increase coverage while 
 \end{table}
 
 
-% ================================================================= TASK 2
+\newpage
 \section{Task 2: Cache Replacement Policy}
 
 % ---------------------------------------------------------------- Task 2A
@@ -930,13 +930,198 @@ at a small cost in accuracy, and 8-bit IP tags slightly increase coverage while 
 \label{sec:task2a}
 
 \subsubsection{Design}
-\todo{changes to \texttt{update\_replacement\_state}, insertion, promotion, eviction}
+
+\paragraph{Passing the instruction bit.} \texttt{update\_replacement\_state} now takes an extra last
+argument \texttt{uint8\_t isInstruction}. The declaration in \texttt{inc/cache.h}, every
+\texttt{replacement/*} file and every call site in \texttt{src/cache.cc} and \texttt{src/ooo\_cpu.cc}
+were updated. Call sites pass the \texttt{instruction} field of the packet being filled or hit. \newline
+The policy treats a request as an instruction request only if
+\texttt{isInstruction \&\& (type == LOAD || type == PREFETCH)}. This is the same rule
+\texttt{fill\_cache} uses to set \texttt{block.instruction} in the L2C. \newline
+\texttt{find\_victim} does not receive the flag, so
+it reads \texttt{current\_set[way].instruction}.
+
+\paragraph{Policy} (\texttt{replacement/irrip.l2c\_repl}). I-RRIP is SRRIP with a 2-bit RRPV
+(0 = near, 3 = distant) that treats instruction lines, data lines and writebacks differently.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{lcc}
+        \toprule
+        Event & SRRIP (given \texttt{rrip.l2c\_repl}) & I-RRIP \\
+        \midrule
+        Fill, instruction line   & 2 & 2 \\
+        Fill, data line          & 2 & 3 \\
+        Fill, writeback          & 2 & 3 \\
+        Hit, instruction line    & 0 & 0 \\
+        Hit, data line           & 0 & 2 \\
+        Hit, writeback           & 0 & unchanged \\
+        Victim                   & first line at 3 & first \emph{data} line at 3, else first line at 3 \\
+        \bottomrule
+    \end{tabular}
+    \caption{RRPV assigned on each event. If no line is at 3, all RRPVs in the set are incremented and the search repeats.}
+\end{table}
+
+\paragraph{Storage.} 2 bits $\times$ 1024 sets $\times$ 8 ways $= 2$~KB, the same as SRRIP. The
+instruction bit is already stored with each L2C block, so no new state is needed.
+
+\paragraph{How the values were chosen.} The six values above and the eviction preference were parameters that we changed from
+run to run to observe how the speedup and MPKI change. We ran simulations on combinations with the same philosophy: that we should
+prioritize instruction lines staying in the cache over data lines. This means that we always inserted instruction lines with an RRPV value
+that was $\leq$ the insertion RRPV of data. We then checked the average L2 instruction MPKI and speedup and chose the best one accordingly.
+
 
 \subsubsection{Rationale}
-\todo{why insertion, promotion and eviction were modified or not modified, and why this choice is best}
+
+The table below starts from the final policy and changes one decision at a time (geomean speedup
+over LRU; MPKIs are averages over the three traces). The last rows are the starting point we
+tried first and RRIP-like settings.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{lrrr}
+        \toprule
+        Policy & Speedup & L2 instr.\ MPKI & L2 data MPKI \\
+        \midrule
+        Final I-RRIP                                 & 1.0216 & 5.94  & 8.02 \\
+        \midrule
+        Eviction: plain SRRIP victim (no data-first) & 1.0214 & 6.13  & 7.87 \\
+        Promote data hit to 3 (no protection)        & 1.0203 & 5.94  & 8.55 \\
+        Promote data hit to 1 instead of 2           & 1.0203 & 6.23  & 7.77 \\
+        Promote data hit to 0 instead of 2           & 1.0191 & 6.51  & 7.59 \\
+        Promote instruction hit to 1 instead of 0    & 1.0174 & 6.16  & 8.00 \\
+        Insert writeback at 2 instead of 3           & 1.0157 & 6.37  & 7.56 \\
+        Insert instruction at 1 instead of 2         & 1.0148 & 6.33  & 8.07 \\
+        Insert instruction at 0 instead of 2         & 1.0118 & 6.59  & 8.10 \\
+        Insert data at 2 instead of 3                & 1.0114 & 7.32  & 6.75 \\
+        \midrule
+        First attempt (instr 0, data 2, WB 3, promote 0/0) & 1.0076 & 8.09 & 6.75 \\
+        All fills at 2, no priority, no WB promotion  & 1.0045 & 9.33  & 6.04 \\
+        Given SRRIP (\texttt{rrip.l2c\_repl})         & 1.0008 & 10.19 & 6.01 \\
+        \bottomrule
+    \end{tabular}
+    \caption{One-at-a-time changes from the final policy.}
+    \label{tab:task2a-ablation}
+\end{table}
+
+\paragraph{Reading the RRPV.} The RRPV of a line is a prediction of how soon it will be reused: 0
+is kept longest, 3 is the next victim. A fill enters at an intermediate value and has to be hit
+to be promoted. When no line in the set is at 3, every RRPV in the set is incremented by one (an
+\emph{aging step}) and the search repeats. This happens only on a miss. So the RRPV a class of
+lines gets on fill and on hit decides how many aging steps (misses to that set) it survives.
+Table~\ref{tab:task2a-protect} lists this for I-RRIP.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{lcc}
+        \toprule
+        Line class & RRPV & Aging steps before it can be evicted \\
+        \midrule
+        Writeback fill, or data fill that is never hit & 3 & 0 \\
+        Instruction fill, never hit                    & 2 & 1 \\
+        Data line after a hit                          & 2 & 1 \\
+        Instruction line after a hit                   & 0 & 3 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Protection given to each class of line in I-RRIP. Within the same RRPV, data lines are evicted before instruction lines. A data line never ranks above an instruction line.}
+    \label{tab:task2a-protect}
+\end{table}
+
+\paragraph{Insertion (modified, the largest effect).} SRRIP inserts every line at 2. The idea
+behind inserting below the maximum protection is scan resistance: a line that was just fetched has
+shown no reuse yet, so it should not displace lines that have. Two properties of the L2 make
+the type of a line a useful extra signal, and I-RRIP uses them to choose a different insertion
+value for each type.
+\begin{itemize}
+    \item \textbf{Instruction lines reuse more, and their misses cost more.} The code footprint
+          is larger than the L1I, so code that the L1I evicts is fetched again, and the L2 is where
+          it is found. Code is also executed repeatedly (loops, shared library functions). An
+          instruction miss stalls fetch and decode, so the core has nothing to execute, while an
+          out-of-order core can overlap part of a data miss with other work. Both facts argue for
+          keeping instruction lines longer.
+    \item \textbf{Data lines at the L2 are often not reused.} The L1D has already absorbed
+          the short-range temporal reuse, so a data line filled into the L2 is often touched once
+          (streaming or scan-like accesses). Keeping such a line costs a way that an instruction line could use.
+    \item \textbf{Writebacks are not demand requests.} A written-back line only moves the L1D's
+          dirty copy down; nothing shows that the program will read it from the L2 again soon.
+\end{itemize}
+This gives the insertion values: \emph{data and writebacks at 3} (next victim, they leave first
+unless a hit proves reuse) and \emph{instruction lines at 2} (one aging step of grace). The data
+value is the most important decision in the policy. Placing data at 2 instead keeps one-shot
+data around for an extra aging step, so it competes with instructions and the speedup falls from 1.0216 to 1.0114
+and the average instruction MPKI rises from 5.94 to 7.32 (Table~\ref{tab:task2a-ablation}). The cost
+of data at 3 is that some data lines which would have been reused after a longer gap are lost,
+so the data MPKI rises. That is the intended trade, because the instruction misses saved are more costly. Writebacks
+behave the same way: at 2 instead of 3 they push the instruction MPKI up (5.94 to 6.37) and the
+speedup down (1.0157).
+
+Instruction lines are deliberately \emph{not} inserted at 0, even though 0 looks like stronger
+priority. The RRPV only carries information if a fresh line and a line that has been hit
+have different values. At 0 they look the same, and equal RRPVs are resolved by way index (the
+victim search takes the first match), not by recency. A code line that is never fetched again then
+stays as long as hot code. Inserting at 0 gives a speedup of 1.0118 and at 1 of 1.0148, against 1.0216
+at 2, and Trace1 falls below LRU (0.994 at 0). On Trace2 the instruction MPKI is higher at 0 than at 2 (9.80 against 8.22), so the extra priority
+does not even reduce instruction misses. At 2 a line has to be hit to reach 0, so the RRPV separates proven
+code from unproven code.
+
+\paragraph{Promotion (modified).} A hit is the only evidence of reuse that the policy gets, and
+SRRIP uses it by resetting the RRPV to 0 (hit priority). I-RRIP keeps that for instruction lines
+and weakens it for data. The strength of the promotion follows how reliable the evidence is and what a miss on
+the line would cost.
+\begin{itemize}
+    \item \textbf{Instruction hit $\to$ 0.} A code line that is hit again is likely to be hit again,
+          and its miss is expensive, so it gets the full promotion to RRPV=0.
+          Promoting to 1 instead removes one step; the speedup falls to 1.0174 and the instruction MPKI rises
+          to 6.16.
+    \item \textbf{Data hit $\to$ 2.} A single hit on a data line is weaker evidence than a hit on code,
+          and the line is cheaper to lose, so we tried all four values.
+          Promoting to 0 or 1 protects a once-hit data line for three or two aging steps. That is as long
+          as, or longer than, a fresh instruction line, so data crowds out code (instruction MPKI 6.51 and 6.23,
+          speedup 1.0191 and 1.0203). At 2 a hit keeps the line for one aging step, like a fresh instruction line,
+          and data-first eviction settles ties. The instruction MPKI falls to 5.94 and the speedup is the
+          best, 1.0216. At 3 a hit gives no protection. The instruction MPKI stays at 5.94, but the data MPKI
+          jumps to 8.55 and the total L2C load MPKI to 14.48 (13.96 at 2), and the speedup drops to 1.0203.
+          So 2 is the point where a hit still counts but a data line never ranks above an instruction line.
+    \item \textbf{Writeback hit $\to$ unchanged.} A writeback that finds its line in the L2 is the L1D
+          returning a dirty copy. The program has not read the line from the L2, so promoting it would
+          measure L1D traffic and not L2 reuse. The given SRRIP promotes it to 0, which keeps lines
+          that are not being reused. Leaving the RRPV alone is the only difference between SRRIP and the policy
+          with all fills at 2, and it is worth +0.4\% by itself (1.0045 against 1.0008).
+\end{itemize}
+
+\paragraph{Eviction (modified, small effect).} SRRIP evicts the first way at the maximum RRPV, and ages the set when none
+is there. I-RRIP keeps this order and adds a tie-break: among the ways at RRPV 3, a data line
+is evicted before an instruction line. The RRPV is the reuse prediction, and when two lines have the same
+prediction the cheaper miss should go first. The type is therefore a second criterion and not a
+hard partition. We do not evict data lines first regardless of RRPV, because a stale instruction
+line (one that was hit long ago and has aged to 3) must be able to leave. Instruction lines are
+not pinned: the aging step always brings them to 3, and when no data line is at 3 an instruction line is
+evicted. Invalid ways start at 3 and are not instruction lines, so they are used first.
+
+The tie-break matters because data and instruction lines often share an RRPV: a once-hit data line and a fresh
+instruction line are both at 2, and a stale instruction line and a one-shot data line are both at 3. Data-first
+eviction makes the data line leave first in both cases. Without it the speedup is 1.0214 against 1.0216 and the
+instruction MPKI is 6.13 against 5.94 (Trace2: 8.68 against 8.22). The effect is small and not uniform:
+Trace1 is marginally better without it (1.0062 against 1.0055, with a lower data MPKI of 9.51 against 9.71),
+but Trace2, Trace3 and the average favour it.
+
+\paragraph{Why this design.} The three changes work together. Insertion and promotion set the
+ranking, and the eviction preference only breaks ties at RRPV 3. Moving from RRIP to the final policy
+is worth +2.1\% of speedup and a 42\% drop in average L2 instruction MPKI (10.19 $\to$ 5.94).
+Settings that give lower data MPKI (e.g.\ data inserted at 2) lose speedup and raise
+instruction MPKI. The final policy also has essentially the lowest average L2 instruction MPKI of all 112
+policies we simulated (a variant that does not promote data hits is lower by 0.001, 5.936, but has a lower speedup),
+so both goals (speedup and L2 instruction MPKI) are met by the same policy.
+
+\paragraph{Wider RRPV (not adopted).} We also tried a maximum RRPV of 4, 5 and 7 with the same structure
+(instruction at max$-1$, data and writebacks at max). The best 3-bit policy reached 1.0256 (+0.4\% over the final 2-bit policy) but needs 3~KB, so we keep the 2-bit design. Run logs (ChampSim output) are in \texttt{results/task2/maxrrpv}.
 
 \subsubsection{Results}
-\todo{IPC, speedup, Load MPKI of L2C, L2 Instruction and L2 Data}
+
+All runs use 25M warmup and 25M simulated instructions. Speedup is $\mathrm{IPC}_{\text{policy}} /
+\mathrm{IPC}_{\text{LRU}}$ (no L1D prefetcher in all three runs). MPKIs are L2C \emph{load}
+misses per kilo-instruction, split into instruction and data loads. The ``avg'' row is the geometric
+mean for IPC and speedup and the arithmetic mean for MPKI.
 
 \begin{table}[H]
     \centering
@@ -944,15 +1129,60 @@ at a small cost in accuracy, and 8-bit IP tags slightly increase coverage while 
         \toprule
         Trace & Policy & IPC & Speedup & L2C load MPKI & L2 instr.\ MPKI & L2 data MPKI \\
         \midrule
-        \todo{} & & & & & & \\
+        Trace1 & LRU     & 0.2321 & 1.000 & 17.73 & 10.37 & 7.36 \\
+               & RRIP    & 0.2321 & 1.000 & 17.66 & 10.58 & 7.07 \\
+               & I-RRIP  & 0.2334 & 1.006 & 18.63 & 8.92  & 9.71 \\
+        \midrule
+        Trace2 & LRU     & 0.2500 & 1.000 & 28.55 & 19.84 & 8.71 \\
+               & RRIP    & 0.2508 & 1.003 & 26.89 & 18.78 & 8.11 \\
+               & I-RRIP  & 0.2632 & 1.053 & 19.40 & 8.22  & 11.17 \\
+        \midrule
+        Trace3 & LRU     & 0.3819 & 1.000 & 3.96  & 1.13  & 2.83 \\
+               & RRIP    & 0.3816 & 0.999 & 4.04  & 1.20  & 2.84 \\
+               & I-RRIP  & 0.3845 & 1.007 & 3.85  & 0.67  & 3.18 \\
+        \midrule
+        avg    & LRU     & 0.2809 & 1.000 & 16.75 & 10.45 & 6.30 \\
+               & RRIP    & 0.2811 & 1.001 & 16.20 & 10.19 & 6.01 \\
+               & I-RRIP  & 0.2869 & 1.022 & 13.96 & 5.94  & 8.02 \\
         \bottomrule
     \end{tabular}
     \caption{Task 2A results.}
+    \label{tab:task2a-main}
 \end{table}
 
-\todo{plots}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.48\textwidth]{../results/task2/plots/ipc.png}\hfill
+    \includegraphics[width=0.48\textwidth]{../results/task2/plots/speedup.png}
+    \caption{IPC (left) and speedup over LRU (right).}
+\end{figure}
 
-% ---------------------------------------------------------------- Task 2B
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.32\textwidth]{../results/task2/plots/l2c_load_mpki.png}\hfill
+    \includegraphics[width=0.32\textwidth]{../results/task2/plots/l2c_instr_mpki.png}\hfill
+    \includegraphics[width=0.32\textwidth]{../results/task2/plots/l2c_data_mpki.png}
+    \caption{L2C load MPKI: total (left), instruction (middle), data (right).}
+\end{figure}
+
+\paragraph{Observations.}
+\begin{itemize}
+    \item \textbf{Instruction MPKI drops on every trace}: by 14\% (Trace1), 59\% (Trace2) and 41\%
+          (Trace3) compared to LRU, and 42\% on average compared to RRIP.
+    \item \textbf{Data MPKI rises on every trace} (+32\%, +28\%, +12\% over LRU), which is the cost of
+          the priority.
+    \item \textbf{Trace2 gets almost all the speedup} (1.053): its instruction MPKI is the highest
+          (19.8), so it has the most to gain, and the total L2C load MPKI falls from 28.6 to 19.4.
+    \item \textbf{Trace1 improves IPC although total L2C load MPKI goes up} (17.73 $\to$ 18.63).
+          Its instruction misses fall by 1.45 MPKI but data misses rise by 2.35 MPKI. It might be because
+          an instruction miss stalls the front end, while out-of-order execution can hide part
+          of a data-miss latency.
+    \item \textbf{Trace3 changes little} (1.007): its instruction MPKI is only 1.1 under LRU,
+          so there are few instruction misses to remove.
+    \item \textbf{RRIP alone gives no gain} (1.001); the benefit comes from the instruction-aware changes.
+\end{itemize}
+
+\newpage
 \subsection{Task 2B: Dynamic I-RRIP}
 \label{sec:task2b}
 

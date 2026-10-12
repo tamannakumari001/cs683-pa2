@@ -7,6 +7,11 @@ report/*.log
 report/*.out
 report/*.fls
 report/*.fdb_latexmk
+*.pdf
+!report.pdf
+temp/
+*.md
+!README.md
 
 # helper scripts used only to run/parse/plot locally
 scripts/

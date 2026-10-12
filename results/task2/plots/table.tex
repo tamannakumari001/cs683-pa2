@@ -1,0 +1,22 @@
+% avg row: geomean for IPC/Speedup, arithmetic mean for MPKI
+\begin{tabular}{llrrrrr}
+\toprule
+Config & Trace & IPC & Speedup & L2C MPKI & L2 Instr MPKI & L2 Data MPKI \\
+\midrule
+lru & Trace1 & 0.232 & 1.000 & 17.73 & 10.37 & 7.36 \\
+lru & Trace2 & 0.250 & 1.000 & 28.55 & 19.84 & 8.71 \\
+lru & Trace3 & 0.382 & 1.000 & 3.96 & 1.13 & 2.83 \\
+lru & avg & 0.281 & 1.000 & 16.75 & 10.45 & 6.30 \\
+\midrule
+rrip & Trace1 & 0.232 & 1.000 & 17.66 & 10.58 & 7.07 \\
+rrip & Trace2 & 0.251 & 1.003 & 26.89 & 18.78 & 8.11 \\
+rrip & Trace3 & 0.382 & 0.999 & 4.04 & 1.20 & 2.84 \\
+rrip & avg & 0.281 & 1.001 & 16.20 & 10.19 & 6.01 \\
+\midrule
+irrip & Trace1 & 0.233 & 1.005 & 18.51 & 9.11 & 9.40 \\
+irrip & Trace2 & 0.263 & 1.050 & 19.62 & 8.84 & 10.77 \\
+irrip & Trace3 & 0.384 & 1.006 & 3.86 & 0.72 & 3.14 \\
+irrip & avg & 0.287 & 1.020 & 14.00 & 6.23 & 7.77 \\
+\midrule
+\bottomrule
+\end{tabular}
