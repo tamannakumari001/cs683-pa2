@@ -1,0 +1,167 @@
+#include "cache.h"
+
+#define maxRRPV 3
+
+#ifndef NUM_LEADERS
+#define NUM_LEADERS 32
+#endif
+#ifndef W_INSTR
+#define W_INSTR 3
+#endif
+#ifndef PSEL_BITS
+#define PSEL_BITS 10
+#endif
+#ifndef EVICT_DATA_FIRST
+#define EVICT_DATA_FIRST 1
+#endif
+
+// I-RRIP params (same as irrip.l2c_repl)
+#define INS_INSTR 2
+#define INS_DATA 3
+#define INS_WB 3
+#define PROMO_INSTR 0
+#define PROMO_DATA 2
+
+#define PSEL_MAX ((1 << PSEL_BITS) - 1)
+#define PSEL_MID (1 << (PSEL_BITS - 1))
+
+enum SetRole { FOLLOWER = 0, LEADER_RRIP = 1, LEADER_IRRIP = 2 };
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+static int32_t  psel = PSEL_MID;
+
+// statistics
+static uint64_t st_load_instr_acc = 0, st_load_instr_miss = 0;
+static uint64_t st_load_data_acc = 0,  st_load_data_miss = 0;
+static uint64_t st_samples = 0, st_samples_irrip = 0, st_switches = 0;
+static uint64_t st_event_cnt = 0;
+static bool     st_prev_mode = false;
+static uint64_t st_leader_miss_rrip = 0, st_leader_miss_irrip = 0;
+
+static inline SetRole role_of(uint32_t set)
+{
+    const uint32_t stride = L2C_SET / NUM_LEADERS;      // >= 2 required
+    const uint32_t off    = set % stride;
+    const uint32_t a      = (set / stride) % stride;
+    if (off == a)                          return LEADER_RRIP;
+    if (off == (a + stride / 2) % stride)  return LEADER_IRRIP;
+    return FOLLOWER;
+}
+
+static inline bool follower_mode_irrip() { return psel > PSEL_MID; }
+
+static inline bool set_uses_irrip(uint32_t set)
+{
+    SetRole r = role_of(set);
+    if (r == LEADER_RRIP)  return false;
+    if (r == LEADER_IRRIP) return true;
+    return follower_mode_irrip();
+}
+
+// initialize replacement state
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize Dynamic I-RRIP (set dueling) for L2C: leaders/policy="
+         << NUM_LEADERS << " W_INSTR=" << W_INSTR << " PSEL_BITS=" << PSEL_BITS
+         << " EVICT_DATA_FIRST=" << EVICT_DATA_FIRST << endl;
+
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++)
+            l2_rrpv[i][j] = maxRRPV;
+}
+
+// find replacement victim
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    const bool irrip = set_uses_irrip(set);
+
+    while (1)
+    {
+        if (irrip && EVICT_DATA_FIRST) {
+            for (int i = 0; i < L2C_WAY; i++)
+                if (l2_rrpv[set][i] == maxRRPV && !current_set[i].instruction)
+                    return i;
+        }
+
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_rrpv[set][i] == maxRRPV)
+                return i;
+
+        for (int i = 0; i < L2C_WAY; i++)
+            l2_rrpv[set][i]++;
+    }
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+// cache hit and cache fill
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if (!(type == LOAD || type == RFO || type == PREFETCH || type == WRITEBACK ||
+          type == LOAD_TRANSLATION || type == PREFETCH_TRANSLATION ||
+          type == TRANSLATION_FROM_L1D))
+        assert(0);
+
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    const bool is_instr = isInstruction && (type == LOAD || type == PREFETCH);
+    const SetRole role  = role_of(set);
+
+    if (type == LOAD) {
+        if (isInstruction) { st_load_instr_acc++; if (!hit) st_load_instr_miss++; }
+        else               { st_load_data_acc++;  if (!hit) st_load_data_miss++;  }
+    }
+
+    if (role != FOLLOWER && !hit && type != WRITEBACK && type != PREFETCH) {
+        int cost = is_instr ? W_INSTR : 1;
+        if (role == LEADER_RRIP)  { psel += cost; st_leader_miss_rrip++; }
+        else                      { psel -= cost; st_leader_miss_irrip++; }
+        if (psel > PSEL_MAX) psel = PSEL_MAX;
+        if (psel < 0)        psel = 0;
+
+        // sample the follower decision for reporting
+        if (++st_event_cnt % 4096 == 0) {
+            bool m = follower_mode_irrip();
+            st_samples++;
+            if (m) st_samples_irrip++;
+            if (m != st_prev_mode) st_switches++;
+            st_prev_mode = m;
+        }
+    }
+
+    if (!set_uses_irrip(set)) {
+        // plain SRRIP
+        if (hit) l2_rrpv[set][way] = 0;
+        else     l2_rrpv[set][way] = maxRRPV - 1;
+        return;
+    }
+
+    // I-RRIP behaviour
+    if (hit) {
+        if (type == WRITEBACK) return;
+        l2_rrpv[set][way] = is_instr ? PROMO_INSTR : PROMO_DATA;
+    } else {
+        if (type == WRITEBACK)  l2_rrpv[set][way] = INS_WB;
+        else if (is_instr)      l2_rrpv[set][way] = INS_INSTR;
+        else                    l2_rrpv[set][way] = INS_DATA;
+    }
+}
+
+// print stats at end of simulation (parsed by run_dyn_irrip.py)
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "DYN_IRRIP L2I_LOAD_ACCESS: " << st_load_instr_acc
+         << " L2I_LOAD_MISS: " << st_load_instr_miss
+         << " L2D_LOAD_ACCESS: " << st_load_data_acc
+         << " L2D_LOAD_MISS: " << st_load_data_miss << endl;
+    cout << "DYN_IRRIP EPOCHS: " << st_samples
+         << " EPOCHS_IRRIP: " << st_samples_irrip
+         << " SWITCHES: " << st_switches
+         << " FINAL_PSEL: " << psel << "/" << PSEL_MAX
+         << " LEADER_MISS_RRIP: " << st_leader_miss_rrip
+         << " LEADER_MISS_IRRIP: " << st_leader_miss_irrip << endl;
+}
