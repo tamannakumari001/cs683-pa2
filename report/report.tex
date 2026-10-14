@@ -1348,6 +1348,7 @@ no L1D prefetcher). The ``avg'' row is the geometric mean for IPC and speedup an
 
 \begin{table}[H]
     \centering
+    \resizebox{\textwidth}{!}{%
     \begin{tabular}{llrrrrr}
         \toprule
         Trace & Policy & IPC & Speedup & L2C load MPKI & L2 instr.\ MPKI & L2 data MPKI \\
@@ -1372,7 +1373,7 @@ no L1D prefetcher). The ``avg'' row is the geometric mean for IPC and speedup an
                & I-RRIP    & 0.2869 & 1.022 & 13.96 & 5.94  & 8.02 \\
                & Dyn.\ I-RRIP & 0.2868 & 1.021 & 14.02 & 6.09  & 7.93 \\
         \bottomrule
-    \end{tabular}
+    \end{tabular}}
     \caption{Task 2B results: Dynamic I-RRIP ($W=4$) against LRU, RRIP and static I-RRIP.}
     \label{tab:task2b-main}
 \end{table}
@@ -1414,29 +1415,153 @@ no L1D prefetcher). The ``avg'' row is the geometric mean for IPC and speedup an
 \label{sec:task3}
 
 \subsection{Design}
-\todo{prefetch awareness in \texttt{replacement/dyn\_irrip.l2c\_repl}}
 
-\subsection{Rationale for handling prefetch packets}
-\todo{why the replacement policy treats prefetch packets this way}
-
-\subsection{Results}
-\todo{IPC, speedup, prefetch accuracy, coverage, Load MPKI of L1D, L2C, L2 Instruction and L2 Data}
+The L1D now runs the Stride Pattern Prefetcher of Task~1B. A prefetch that misses in the L1D travels to the L2C as a packet of
+type \texttt{PREFETCH}, and it fetches data only (instruction prefetching is off). The replacement policy tells these packets apart from
+demand requests by the packet type and, on a hit, by the per-line ``brought by a prefetch'' bit that ChampSim already keeps
+for its prefetch statistics. The three prefetch rules below live in \texttt{replacement/dyn\_irrip.l2c\_repl}. They are active in
+I-RRIP mode only, so the SRRIP leader sets, and the followers while they run SRRIP, remain the plain SRRIP baseline of the duel.
+Instruction lines are handled exactly as in Task~2B.
 
 \begin{table}[H]
     \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{lll}
+        \toprule
+        Event (data prefetch) & Task 2B behaviour & Prefetch-aware behaviour \\
+        \midrule
+        Fill by a prefetch              & RRPV 3 (as any data fill)  & RRPV 3 (\texttt{PF\_INS}) \\
+        Prefetch hits a resident line   & promote to 2               & leave the RRPV unchanged \\
+        First demand hit on a prefetched line & promote to 2         & RRPV 2 (\texttt{PF\_HIT\_PROMO}) \\
+        \bottomrule
+    \end{tabular}}
+    \caption{Handling of prefetch packets in I-RRIP mode.}
+\end{table}
+
+The set-dueling logic is untouched: prefetch accesses still count in the leader sets. The only added state is the one-bit
+``prefetched'' flag per line (1~KB for the 8192 lines of the L2C).
+
+\subsection{Rationale for handling prefetch packets}
+
+\paragraph{A prefetched line is speculative.} A replacement policy ranks lines by expected reuse. A demand-fetched line has proven
+that the program wants it. A prefetched line only has a guess behind it, and SPP's guesses are right 43\% of the time on
+average (accuracy 26--57\% across the traces). Giving such a line the same standing as a demanded one lets wrong guesses
+displace lines with proven reuse. That hurts most for instruction lines, which I-RRIP exists to protect. We therefore insert prefetch
+fills as distant (RRPV 3), where they are the first candidates for eviction if they are not used.
+
+\paragraph{A prefetch hit is not evidence of reuse.} If a prefetch finds the line already in the L2C, SPP merely asked for it again.
+No instruction has used it, so promoting it would hand the protection reserved for reused lines to a speculative request. We leave the
+RRPV unchanged.
+
+\paragraph{A prefetched line is mostly dead in the L2C after its first use.} SPP chooses the fill level of each prefetch from the
+L1D's MSHR occupancy: below half full the line is brought into the L1D (and passes through the L2C), otherwise it is placed in the L2C only.
+In the first case the L1D serves the demand access, and the L2C copy is a second copy that is needed only if the L1D evicts the line early.
+In the second case the demand access hits the L2C, and this hit is the one useful event that the line will ever have there.
+Either way the line is not part of a reuse pattern that the L2C should keep: once its demand access has been served, nothing in the stream
+suggests that it will be needed again. The first demand hit on a prefetched line therefore does not earn the full promotion to RRPV 0,
+and the line is not kept near. We set it to 2, the same value as an ordinary data hit, so it still gets one aging step of protection.
+
+\paragraph{What we tested.} We swept the insertion value and the value after the first demand hit, with two further options
+(excluding prefetches from the duel, and demoting a line on a prefetch hit). The measurements agree with the reasoning, but the
+differences are small:
+\begin{itemize}
+    \item \textbf{Insertion at 2 is worse than at 3} in every combination (geomean speedup 1.0220--1.0226 against 1.0240--1.0244), so
+          keeping prefetches distant is right: protecting speculative lines costs more in pollution than it gains.
+    \item \textbf{Promoting a line to 0 on its first demand hit is worse} than to 2 or 3 (1.0240 against 1.0244), which supports the
+          ``dead after first use'' argument.
+    \item \textbf{Excluding prefetches from the duel, and demoting on a prefetch hit, change nothing measurable} (within 0.0002),
+          so they are not used. Prefetch traffic in the leader sets is too small to move PSEL.
+\end{itemize}
+
+\subsection{Results}
+
+All runs use 25M warmup and 25M simulated instructions. Speedup is relative to the baseline without prefetcher and with an LRU L2C.
+Accuracy is the \texttt{ACCURACY} value that ChampSim prints for the L1D (useful prefetches over prefetches issued to the L2C),
+and coverage is the reduction in L1D load misses relative to the no-prefetch baseline, as in Task~1. The ``avg'' row is the
+geometric mean for IPC and speedup and the arithmetic mean for the other columns. \emph{Dyn.\ I-RRIP} is the Task~2B policy.
+\emph{SPP + Dyn.\ I-RRIP} runs it without prefetch handling and \emph{(PF)} is the prefetch-aware version.
+
+\begin{table}[H]
+    \centering
+    \small
+    \setlength{\tabcolsep}{4pt}
+    \resizebox{\textwidth}{!}{%
     \begin{tabular}{llrrrrrrrr}
         \toprule
         Trace & Config & IPC & Speedup & Acc.\ (\%) & Cov.\ (\%) & L1D MPKI & L2C MPKI & L2 instr.\ MPKI & L2 data MPKI \\
         \midrule
-        \todo{} & & & & & & & & & \\
+        Trace1 & LRU (no pref.)           & 0.2321 & 1.0000 & --   & --   & 10.68 & 17.73 & 10.37 & 7.36 \\
+               & Dyn.\ I-RRIP             & 0.2336 & 1.0063 & --   & --   & 10.68 & 18.58 & 8.97  & 9.61 \\
+               & SPP + LRU                & 0.2330 & 1.0039 & 57.1 & 5.4  & 10.10 & 17.21 & 10.40 & 6.81 \\
+               & SPP + RRIP               & 0.2330 & 1.0037 & 57.3 & 5.5  & 10.10 & 17.17 & 10.61 & 6.56 \\
+               & SPP + Dyn.\ I-RRIP       & 0.2347 & 1.0111 & 57.1 & 5.4  & 10.11 & 17.91 & 8.97  & 8.94 \\
+               & SPP + Dyn.\ I-RRIP (PF)  & 0.2347 & 1.0112 & 57.1 & 5.4  & 10.10 & 17.91 & 8.97  & 8.94 \\
+        \midrule
+        Trace2 & LRU (no pref.)           & 0.2500 & 1.0000 & --   & --   & 13.54 & 28.55 & 19.84 & 8.71 \\
+               & Dyn.\ I-RRIP             & 0.2626 & 1.0507 & --   & --   & 13.55 & 19.62 & 8.61  & 11.01 \\
+               & SPP + LRU                & 0.2501 & 1.0006 & 46.9 & 0.7  & 13.44 & 28.49 & 19.84 & 8.65 \\
+               & SPP + RRIP               & 0.2509 & 1.0036 & 46.8 & 0.7  & 13.44 & 26.84 & 18.79 & 8.04 \\
+               & SPP + Dyn.\ I-RRIP       & 0.2629 & 1.0515 & 47.0 & 0.6  & 13.45 & 19.52 & 8.59  & 10.93 \\
+               & SPP + Dyn.\ I-RRIP (PF)  & 0.2629 & 1.0517 & 47.6 & 0.6  & 13.45 & 19.52 & 8.59  & 10.93 \\
+        \midrule
+        Trace3 & LRU (no pref.)           & 0.3819 & 1.0000 & --   & --   & 3.40  & 3.96  & 1.13  & 2.83 \\
+               & Dyn.\ I-RRIP             & 0.3844 & 1.0066 & --   & --   & 3.40  & 3.85  & 0.69  & 3.16 \\
+               & SPP + LRU                & 0.3832 & 1.0036 & 25.7 & 4.3  & 3.26  & 3.71  & 1.14  & 2.57 \\
+               & SPP + RRIP               & 0.3830 & 1.0029 & 25.6 & 4.2  & 3.26  & 3.78  & 1.21  & 2.57 \\
+               & SPP + Dyn.\ I-RRIP       & 0.3860 & 1.0108 & 25.9 & 4.3  & 3.26  & 3.58  & 0.69  & 2.88 \\
+               & SPP + Dyn.\ I-RRIP (PF)  & 0.3860 & 1.0107 & 25.7 & 4.2  & 3.26  & 3.58  & 0.69  & 2.89 \\
+        \midrule
+        avg    & LRU (no pref.)           & 0.2809 & 1.0000 & --   & --   & 9.21  & 16.75 & 10.45 & 6.30 \\
+               & Dyn.\ I-RRIP             & 0.2868 & 1.0210 & --   & --   & 9.21  & 14.02 & 6.09  & 7.93 \\
+               & SPP + LRU                & 0.2816 & 1.0027 & 43.3 & 3.5  & 8.93  & 16.47 & 10.46 & 6.01 \\
+               & SPP + RRIP               & 0.2818 & 1.0034 & 43.2 & 3.5  & 8.93  & 15.93 & 10.20 & 5.72 \\
+               & SPP + Dyn.\ I-RRIP       & 0.2877 & 1.0243 & 43.3 & 3.4  & 8.94  & 13.67 & 6.09  & 7.58 \\
+               & SPP + Dyn.\ I-RRIP (PF)  & 0.2877 & 1.0244 & 43.5 & 3.4  & 8.94  & 13.67 & 6.09  & 7.58 \\
         \bottomrule
-    \end{tabular}
-    \caption{Task 3 results: SPP + Dynamic I-RRIP versus SPP alone and Dynamic I-RRIP alone.}
+    \end{tabular}}
+    \caption{Task 3 results: SPP with prefetch-aware Dynamic I-RRIP against standalone SPP and Dynamic I-RRIP alone.}
+    \label{tab:task3-main}
 \end{table}
 
-\todo{plots}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.48\textwidth]{../results/task3/plots/ipc.png}\hfill
+    \includegraphics[width=0.48\textwidth]{../results/task3/plots/speedup.png}\\[4pt]
+    \includegraphics[width=0.48\textwidth]{../results/task3/plots/pf_accuracy.png}\hfill
+    \includegraphics[width=0.48\textwidth]{../results/task3/plots/coverage.png}
+    \caption{IPC, speedup over LRU, and L1D prefetch accuracy and coverage.}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.48\textwidth]{../results/task3/plots/l1d_load_mpki.png}\hfill
+    \includegraphics[width=0.48\textwidth]{../results/task3/plots/l2c_load_mpki.png}\\[4pt]
+    \includegraphics[width=0.48\textwidth]{../results/task3/plots/l2c_instr_mpki.png}\hfill
+    \includegraphics[width=0.48\textwidth]{../results/task3/plots/l2c_data_mpki.png}
+    \caption{Load MPKI of the L1D and L2C (total, instruction and data).}
+\end{figure}
 
 \subsection{Discussion}
-\todo{comparison against standalone SPP and standalone Dynamic I-RRIP}
+
+\begin{itemize}
+    \item \textbf{It beats both baselines on every trace.} Against standalone SPP (SPP + LRU) the IPC gain is
+          +0.7\%, +5.1\% and +0.7\% on Trace1, Trace2 and Trace3 (geomean speedup 1.0244 against 1.0027). Against Dynamic I-RRIP without a prefetcher it is
+          +0.5\%, +0.1\% and +0.4\% (1.0244 against 1.0210).
+    \item \textbf{Most of the gain over standalone SPP comes from the replacement policy.} SPP alone barely helps: its coverage is 3.4\% on average,
+          and only 0.6\% on Trace2. The dynamic I-RRIP policy removes about 42\% of the L2 instruction misses relative to SPP + LRU
+          and lowers the total L2C load MPKI by 17\%, at the price of more data misses, as in Task~2.
+    \item \textbf{SPP adds a modest benefit on top of Dynamic I-RRIP, mostly on the traces where it covers misses.} The gain is
+          0.4--0.5\% on Trace1 and Trace3, where coverage is 4--5\%, and only 0.1\% on Trace2, whose coverage is close to zero.
+          Trace2 is dominated by instruction misses, which the L1D data prefetcher cannot help.
+    \item \textbf{Prefetch awareness contributes a very small amount.} Compared with running the Task~2B policy unchanged under SPP, the prefetch-aware
+          version moves the geomean speedup from 1.0243 to 1.0244. This is expected. SPP's prefetches are a small fraction of the L2C traffic, so there
+          are few packets for the policy to treat differently, and the prefetch rules mostly agree with what the data rules of Task~2B already do
+          (data is inserted distant, and a data hit is promoted to 2). Where they differ is only the ``prefetch hit is not reuse'' rule.
+    \item \textbf{Accuracy and coverage are determined by SPP, not by the L2C policy.} They are almost the same in all SPP configurations
+          (accuracy 43.2--43.5\%, coverage 3.4--3.5\%), and so is the L1D load MPKI (8.9). The L2C policy decides what stays in the L2C
+          after SPP has made its decisions, so its effect shows up in the L2C MPKI and in IPC and not in the prefetcher metrics.
+    \item \textbf{Accuracy varies a lot with the trace} (57\%, 47\% and 26\%). On Trace3 about three quarters of the prefetches are wasted, which is the
+          case where distant insertion matters most: speculative lines do not displace the protected instruction lines.
+\end{itemize}
 
 \end{document}

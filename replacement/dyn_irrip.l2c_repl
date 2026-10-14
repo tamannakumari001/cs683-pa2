@@ -24,6 +24,13 @@
 #define NO_RUNS 1024
 
 
+// task 3 prefetching parameters
+#define PF_AWARE 1
+#define PF_INS 3
+#define PF_HIT_PROMO 2
+#define PF_EXCLUDE_DUEL 0
+#define PF_PFHIT_DEMOTE 0
+
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
 
 static int32_t psel = PSEL_MID;
@@ -135,7 +142,10 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
 
     bool is_instr = isInstruction && (type == LOAD || type == PREFETCH);
     bool demand = (type == LOAD || type == RFO || type == PREFETCH);
+    if (PF_AWARE && PF_EXCLUDE_DUEL && type == PREFETCH && !is_instr)
+        demand = false;
     int st = set_type(set);
+
     
     if (st && demand) {
         if (st == 1) {
@@ -167,13 +177,23 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
         l2_rrpv[set][way] = hit ? 0 : maxRRPV - 1;
         return;
     }
+    bool pf = (type == PREFETCH) && !is_instr;
 
     if (hit) {
         if (type == WRITEBACK) return;
+        if (PF_AWARE && pf) {
+            if (l2_rrpv[set][way] < PF_PFHIT_DEMOTE) l2_rrpv[set][way] = PF_PFHIT_DEMOTE;
+            return;
+        }
+        if (PF_AWARE && !is_instr && block[set][way].prefetch) {
+            l2_rrpv[set][way] = PF_HIT_PROMO;
+            return;
+        }
         l2_rrpv[set][way] = is_instr ? PROMO_INSTR : PROMO_DATA;
     } else {
         if (type == WRITEBACK) l2_rrpv[set][way] = INS_WB;
         else if (is_instr) l2_rrpv[set][way] = INS_INSTR;
+        else if (PF_AWARE && pf) l2_rrpv[set][way] = PF_INS;
         else l2_rrpv[set][way] = INS_DATA;
     }
 }
