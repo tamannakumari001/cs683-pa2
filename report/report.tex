@@ -1187,28 +1187,164 @@ mean for IPC and speedup and the arithmetic mean for MPKI.
 \label{sec:task2b}
 
 \subsubsection{Design}
-\todo{set dueling, leader sets, decision formula}
+
+I-RRIP lowers instruction misses at the price of more data misses (data MPKI rises by 12--32\% over LRU).
+That trade is only worth it when instruction misses are the costlier ones. A workload with a small code footprint
+or with critical data reuse can do better with plain RRIP. Dynamic I-RRIP therefore chooses between the two
+policies at run time with \emph{set dueling}.
+
+\paragraph{Leader and follower sets.} Of the 1024 L2C sets, 32 are \emph{RRIP leaders} (set index $\bmod 32 = 0$)
+and always run SRRIP. Another 32 are \emph{I-RRIP leaders} ($\bmod 32 = 16$) and always run I-RRIP. The remaining
+960 are \emph{followers} and copy whichever policy is currently winning. The leaders are interleaved
+through the cache, so both groups sample the same program phases and address range as the followers.
+
+\paragraph{Decision rule (final: PSEL duel).} A 10-bit saturating counter, PSEL, starts at 512.
+A demand miss (load, RFO or prefetch) in an RRIP leader \emph{increments} PSEL and a miss in an I-RRIP
+leader \emph{decrements} it, so PSEL rises when RRIP is missing more. Followers use I-RRIP when
+$\text{PSEL} \ge 512$ and SRRIP otherwise. An instruction miss moves PSEL by $W=4$ and a data miss
+by 1. In SRRIP mode a set behaves exactly like the given \texttt{rrip.l2c\_repl} (fill at 2, hit to 0).
+In I-RRIP mode it uses the Task~2A policy.
+
+\paragraph{Threshold rule} We also implemented the rule suggested in the problem statement.
+The RRIP leaders count instruction accesses and misses against all accesses and misses, and followers use
+I-RRIP when
+\[
+  \frac{\text{instr\_acc} + \text{instr\_miss}}{\text{tot\_acc} + \text{tot\_miss}} > T .
+\]
+The ratio is evaluated once every 1024 RRIP-leader events, not on every access, and then all four counters are halved.
+A ratio taken from only a few events is noisy, and every change of decision switches the follower sets between two different
+insertion and promotion behaviours, so deciding on noise would make them alternate. 1024 events average out short bursts, and the
+division and comparison are done once per 1024 accesses instead of per access, with one decision bit kept in between. The run is still
+short enough to follow phases: the leaders see about 3\% of the L2C traffic, so 1024 events give roughly 60 decisions per run.
+The halving of the counters is explained in the rationale below. Both rules
+are in \texttt{replacement/dyn\_irrip.l2c\_repl}. The macro \texttt{USE\_PSEL} selects one of them
+(1 = PSEL duel, the final design; 0 = threshold). The ratio counters keep running in the PSEL design, only to report
+the instruction share in the statistics.
+
+\paragraph{Storage.} The PSEL design needs one 10-bit counter. The leader tests only compare the low five bits of the
+set index. The threshold rule would add four 11-bit counters, a 10-bit event counter and one decision bit (about 55 bits).
 
 \subsubsection{Rationale for the leader sets and decision logic}
-\todo{number of leader sets and why; decision logic and why}
+
+\paragraph{Why set dueling.} The better policy depends on the program and on its phase, and we cannot know it in
+advance. Dueling measures it directly: the leader sets run both policies side by side on the \emph{same} access stream,
+so their miss counts are a fair, up-to-date comparison, and followers follow the best one after both are tested.
+
+\paragraph{Number and layout of leader sets.} 32 leader sets per policy (3\% of the cache each) are enough to collect
+thousands of misses per run, so PSEL is stable, while keeping 94\% of the cache under the winning policy. Fewer leaders
+make the estimate noisy. More leaders force more sets to run the losing policy. The layout is static and interleaved
+(offsets 0 and 16 of a 32-set stride). The 32-leader, 10-bit configuration follows the
+sizes commonly used for set dueling (DIP/DRRIP).
+These sizes were kept fixed; only the decision parameters below were changed for different runs.
+
+\paragraph{Why instruction misses are weighted.} PSEL counts misses, which assumes every miss costs the same. That is not true
+here, and it is the very reason I-RRIP exists. An instruction miss stops the front end: nothing new can be fetched or
+issued until the line returns, so the whole pipeline starves. A data miss only delays the instructions that depend on it, and
+out-of-order execution can keep working on independent instructions in the meantime. I-RRIP therefore deliberately trades
+cheap data misses for expensive instruction misses, and it can even \emph{increase} the total number of misses while
+improving IPC. This happens on Trace1. A duel that counts every miss equally ($W=1$) would judge I-RRIP only by its total miss count and
+reject it there. Counting an instruction miss as $W>1$ data misses makes PSEL measure approximate stall cost
+instead of raw misses. $W$ must at least equal the ratio of data misses gained to instruction misses saved
+(about 1.6 on Trace1).
+
+\paragraph{Why the ratio is not a good rule on its own.} The threshold rule tests how many instruction accesses there are
+and \emph{assumes} that I-RRIP helps when there are many. It never observes whether I-RRIP actually reduces the misses.
+PSEL measures the outcome, which is the reason it is our final choice. The sensitivity study below confirms it.
+
+\paragraph{Why the ratio is evaluated once per 1024 events, and why the counters are halved.}
+A decision from a few events is noisy, and flipping the follower policy on noisy data makes the sets alternate between two
+insertion/promotion behaviours. Averaging over 1024 events smooths bursts. The evaluation is also cheap in hardware:
+one division and one comparison per epoch instead of per access, with a single decision bit kept in between.
+The size of a run cannot be much longer either: the leaders see about 3\% of the L2C traffic, so 1024 events give roughly 60 decisions
+per run, whereas a much longer epoch would give only one or two.
+At the end of each epoch the counters are \emph{halved} (a one-bit right shift). Without this the counters would only
+grow and the ratio would become a whole-run average that cannot follow a phase change. Resetting them to zero instead
+would base every decision on only the last 1024 events.
 
 \subsubsection{Sensitivity study}
-\todo{5 values of the decision parameter (e.g.\ threshold) and their effect}
+
+We swept the decision parameter of each rule: five thresholds $T \in \{0.20, 0.25, 0.30, 0.55, 0.70\}$ for the
+threshold rule (A) and five weights $W \in \{1, 2, 3, 4, 6\}$ for the PSEL rule (B), on all three traces.
+The measured instruction share in the RRIP leaders (averaged over epochs) is 0.44 (Trace1), 0.56 (Trace2) and 0.41 (Trace3).
+It varies a lot within a run (per-epoch minimum--maximum: 0.21--0.52, 0.02--0.68 and 0.08--0.54).
+The thresholds were chosen to lie below all three means (0.20--0.30), between Trace1 and Trace2 (0.55)
+and above all three (0.70). The last column of the table is the share of follower fills that ran in I-RRIP mode on Trace1/2/3.
 
 \begin{table}[H]
     \centering
-    \begin{tabular}{lrrrrr}
+    \small
+    \begin{tabular}{lrrrrrrrr}
         \toprule
-        Parameter value & IPC & Speedup & L2C load MPKI & L2 instr.\ MPKI & L2 data MPKI \\
+        Policy & \multicolumn{3}{c}{Speedup} & Geomean & Instr. & Data & Load & I-RRIP fills (\%) \\
+               & T1 & T2 & T3 & speedup & MPKI & MPKI & MPKI & T1/T2/T3 \\
         \midrule
-        \todo{} & & & & & \\
+        RRIP        & 1.0001 & 1.0031 & 0.9992 & 1.0008 & 10.19 & 6.01 & 16.20 & 0/0/0 \\
+        I-RRIP      & 1.0055 & 1.0530 & 1.0070 & 1.0216 & 5.94  & 8.02 & 13.96 & 100/100/100 \\
+        \midrule
+        A, $T=0.20$ & 1.0052 & 1.0439 & 1.0069 & 1.0185 & 6.26  & 7.86 & 14.12 & 100/85/96 \\
+        A, $T=0.25$ & 1.0053 & 1.0439 & 1.0002 & 1.0163 & 6.34  & 7.82 & 14.16 & 98/84/87 \\
+        A, $T=0.30$ & 1.0053 & 1.0439 & 1.0002 & 1.0163 & 6.34  & 7.82 & 14.16 & 98/84/87 \\
+        A, $T=0.55$ & 0.9995 & 1.0342 & 0.9991 & 1.0108 & 7.45  & 6.78 & 14.22 & 3/67/7 \\
+        A, $T=0.70$ & 0.9995 & 1.0040 & 0.9991 & 1.0009 & 10.15 & 6.01 & 16.16 & 3/2/7 \\
+        \midrule
+        B, $W=1$    & 1.0002 & 1.0505 & 1.0069 & 1.0189 & 6.62  & 7.11 & 13.73 & 2/96/99 \\
+        B, $W=2$    & 1.0057 & 1.0508 & 1.0067 & 1.0209 & 6.09  & 7.92 & 14.02 & 78/98/99 \\
+        B, $W=3$    & 1.0053 & 1.0507 & 1.0067 & 1.0207 & 6.09  & 7.93 & 14.02 & 90/98/100 \\
+        B, $W=4$    & 1.0063 & 1.0507 & 1.0066 & 1.0210 & 6.09  & 7.93 & 14.02 & 96/98/100 \\
+        B, $W=6$    & 1.0056 & 1.0508 & 1.0066 & 1.0208 & 6.09  & 7.93 & 14.02 & 98/98/100 \\
         \bottomrule
     \end{tabular}
-    \caption{Sensitivity of Dynamic I-RRIP to its decision parameter.}
+    \caption{Sensitivity of Dynamic I-RRIP to its decision parameter (A: threshold rule, B: PSEL duel).
+             Speedup is over LRU; MPKIs are averages over the three traces.}
+    \label{tab:task2b-sweep}
 \end{table}
 
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.48\textwidth]{../results/task2/dyn_sweep/plots/sweep_threshold.png}\hfill
+    \includegraphics[width=0.48\textwidth]{../results/task2/dyn_sweep/plots/sweep_weight.png}
+    \caption{Speedup over LRU versus the threshold $T\times1000$ (left) and the instruction-miss weight $W$ (right).
+             The dashed lines are RRIP and I-RRIP.}
+\end{figure}
+
+% \paragraph{Threshold rule.}
+% \begin{itemize}
+%     \item \textbf{It follows the ratio, not the benefit.} At $T=0.20$ Trace1 stays fully in I-RRIP, since its lowest
+%           epoch ratio (0.21) is above $T$, but Trace2 and Trace3 contain epochs with an instruction share below 0.2 and leave
+%           I-RRIP for 15\% and 4\% of their fills. $T=0.25$ and $0.30$ give identical results, so no decision changed between them.
+%     \item \textbf{Wrong decisions are expensive.} Trace2 gains 5.3\% with I-RRIP, and running it in RRIP mode
+%           for 15\% of the fills already costs about 0.9 points. At $T=0.55$ Trace1 and Trace3 fall to RRIP
+%           (3\% and 7\% I-RRIP) and lose their gain. At $T=0.70$ all three traces use RRIP, and the result (1.0009) equals RRIP.
+%     \item \textbf{No threshold is better than always using I-RRIP.} I-RRIP beats RRIP on all three traces, so a rule that only
+%           gates I-RRIP can at best match it (best: 1.0185 at $T=0.20$).
+% \end{itemize}
+
+\paragraph{PSEL rule.}
+\begin{itemize}
+    \item \textbf{$W=1$ fails on Trace1 only.} The duel sees I-RRIP missing more in total, picks RRIP (2\% I-RRIP fills) and Trace1
+          drops to 1.0002. Trace2 and Trace3 are unaffected, since I-RRIP also lowers their total misses.
+    \item \textbf{$W \ge 2$ is flat.} The geomean stays within 1.0207--1.0210 and average instruction MPKI is 6.09.
+          Larger $W$ only increases the I-RRIP share on Trace1 (78\% $\to$ 98\%). The result is insensitive to the exact weight,
+          unlike the threshold, as long as the instruction weight is at least about twice the data weight.
+    \item We choose $W=4$, the best of the plateau (1.0210), where Trace1 uses I-RRIP for 96\% of its fills.
+\end{itemize}
+
+\paragraph{Weighting data misses as well.} We also gave data misses a weight $d>1$ ($d\in\{2,3\}$). Only the ratio $W/d$ matters for which
+policy wins, so this is equivalent to lowering $W$, with a faster-moving PSEL. As expected, it never helped: no combination beat $d=1$.
+A larger $d$ makes data misses count more, which pushes the duel towards RRIP and away from the policy that trades data misses for
+instruction misses. Trace1, where this trade is the tightest, suffers most and Trace2 loses part of its gain at the largest $d$,
+while Trace3 is unaffected. Ratios just above the break-even were also poor on Trace1: the two policies then look almost equally good, so the duel
+is decided by a thin margin and the followers probably alternate between them, which gives up the benefit of both. The instruction weight
+needs a clear margin over the data weight, so we keep $d=1$ and only tune $W$.
+
+\paragraph{A versus B.} The PSEL rule is better in every respect: higher best speedup (1.0210 versus 1.0185), a flat curve
+instead of one that collapses from 1.0185 to 1.0009, and no per-workload tuning. The threshold rule needs a value of $T$ below
+the lowest ratio of every workload to stay safe, in which case it adds nothing over always using I-RRIP.
+
 \subsubsection{Results}
-\todo{IPC, speedup, Load MPKI of L2C, L2 Instruction and L2 Data}
+
+The final configuration is the PSEL duel with $W=4$. Setup is the same as in Task~2A (25M warmup, 25M simulated instructions,
+no L1D prefetcher). The ``avg'' row is the geometric mean for IPC and speedup and the arithmetic mean for MPKI.
 
 \begin{table}[H]
     \centering
@@ -1216,15 +1352,64 @@ mean for IPC and speedup and the arithmetic mean for MPKI.
         \toprule
         Trace & Policy & IPC & Speedup & L2C load MPKI & L2 instr.\ MPKI & L2 data MPKI \\
         \midrule
-        \todo{} & & & & & & \\
+        Trace1 & LRU       & 0.2321 & 1.000 & 17.73 & 10.37 & 7.36 \\
+               & RRIP      & 0.2321 & 1.000 & 17.66 & 10.58 & 7.07 \\
+               & I-RRIP    & 0.2334 & 1.006 & 18.63 & 8.92  & 9.71 \\
+               & Dyn.\ I-RRIP & 0.2336 & 1.006 & 18.58 & 8.97  & 9.61 \\
+        \midrule
+        Trace2 & LRU       & 0.2500 & 1.000 & 28.55 & 19.84 & 8.71 \\
+               & RRIP      & 0.2508 & 1.003 & 26.89 & 18.78 & 8.11 \\
+               & I-RRIP    & 0.2632 & 1.053 & 19.40 & 8.22  & 11.17 \\
+               & Dyn.\ I-RRIP & 0.2626 & 1.051 & 19.62 & 8.61  & 11.01 \\
+        \midrule
+        Trace3 & LRU       & 0.3819 & 1.000 & 3.96  & 1.13  & 2.83 \\
+               & RRIP      & 0.3816 & 0.999 & 4.04  & 1.20  & 2.84 \\
+               & I-RRIP    & 0.3845 & 1.007 & 3.85  & 0.67  & 3.18 \\
+               & Dyn.\ I-RRIP & 0.3844 & 1.007 & 3.85  & 0.69  & 3.16 \\
+        \midrule
+        avg    & LRU       & 0.2809 & 1.000 & 16.75 & 10.45 & 6.30 \\
+               & RRIP      & 0.2811 & 1.001 & 16.20 & 10.19 & 6.01 \\
+               & I-RRIP    & 0.2869 & 1.022 & 13.96 & 5.94  & 8.02 \\
+               & Dyn.\ I-RRIP & 0.2868 & 1.021 & 14.02 & 6.09  & 7.93 \\
         \bottomrule
     \end{tabular}
-    \caption{Task 2B results.}
+    \caption{Task 2B results: Dynamic I-RRIP ($W=4$) against LRU, RRIP and static I-RRIP.}
+    \label{tab:task2b-main}
 \end{table}
 
-\todo{plots}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.48\textwidth]{../results/task2/plots/ipc_rrip_irrip_dyn_irrip.png}\hfill
+    \includegraphics[width=0.48\textwidth]{../results/task2/plots/speedup_rrip_irrip_dyn_irrip.png}
+    \caption{IPC (left) and speedup over LRU (right).}
+\end{figure}
 
-% ================================================================= TASK 3
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.32\textwidth]{../results/task2/plots/l2c_load_mpki_rrip_irrip_dyn_irrip.png}\hfill
+    \includegraphics[width=0.32\textwidth]{../results/task2/plots/l2c_instr_mpki_rrip_irrip_dyn_irrip.png}\hfill
+    \includegraphics[width=0.32\textwidth]{../results/task2/plots/l2c_data_mpki_rrip_irrip_dyn_irrip.png}
+    \caption{L2C load MPKI: total (left), instruction (middle), data (right).}
+\end{figure}
+
+\paragraph{Observations.}
+\begin{itemize}
+    \item \textbf{Dynamic I-RRIP finds the better policy on its own.} Its speedup (1.021) is essentially that of static I-RRIP and
+          about two points above RRIP, and it removes about 40\% of RRIP's L2 instruction misses. PSEL stays far above its midpoint on all
+          three traces, so the duel picks I-RRIP consistently, in the same proportion as in the sweep.
+    \item \textbf{It cannot beat static I-RRIP on these traces.} I-RRIP is already better than RRIP on all three, so the best the duel can do is
+          choose I-RRIP everywhere. Set dueling has a built-in cost: the RRIP leader sets always run the losing policy, and a few follower fills
+          still use RRIP while PSEL moves. This cost scales with the gain: it is visible on Trace2, where I-RRIP helps most, and negligible on Trace3,
+          where it helps little.
+    \item \textbf{Trace1 shows why the weight matters.} Here the duel is closest to a tie, because I-RRIP saves instruction misses but adds data misses.
+          The weighted PSEL still resolves it in favour of I-RRIP, and the few sets that stay in RRIP mode even keep data misses slightly lower. We
+          treat the small gain over static I-RRIP as incidental rather than a general benefit.
+    \item \textbf{The value of the dynamic policy is robustness, not peak speedup.} A fixed policy, or a threshold set for one workload, loses
+          whenever the workload changes: the sweep shows threshold rules falling back to RRIP's level. The duel needs no workload knowledge. On a program where
+          I-RRIP hurt, PSEL would drop below its midpoint and the followers would switch to SRRIP.
+\end{itemize}
+
+\newpage
 \section{Task 3: Incorporating SPP with Dynamic I-RRIP}
 \label{sec:task3}
 

@@ -1,0 +1,195 @@
+#include "cache.h"
+
+#define maxRRPV 3
+
+// parameters for IRRIP
+#define INS_INSTR 2
+#define INS_DATA 3
+#define INS_WB 3
+#define PROMO_INSTR 0
+#define PROMO_DATA 2
+#define EVICT_DATA_FIRST 1
+
+// parameters for set-dueling
+#define USE_PSEL 1 // 0 is threshold based, 1 is PSEL saturating counter 
+#define INSTR_MISS_W 4 // defines how far an instruction miss moves the weight of PSEL
+#define DATA_MISS_W 1
+#define THRESH_MILLI 0
+#define LEADER_STRIDE 32 // spacing of the leader sets
+#define RRIP_LEADER_OFF 0 // set % 32 == <this> run SRRIP
+#define IRRIP_LEADER_OFF 16 // set % 32 == <this> run IRRIP
+#define PSEL_BITS 10
+#define PSEL_MAX ((1 << PSEL_BITS) - 1)
+#define PSEL_MID (1 << (PSEL_BITS - 1))
+#define NO_RUNS 1024
+
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+static int32_t psel = PSEL_MID;
+static bool ratio_ok = true;
+static uint64_t c_iacc = 0, c_imiss = 0, c_tacc = 0, c_tmiss = 0, run_events = 0;
+static uint64_t st_follow_irrip = 0, st_follow_rrip = 0; // misses in follower sets while following respective one
+static uint64_t st_psel_sum = 0, st_psel_n = 0; // running sum of PSEL and number of counter updates
+static uint64_t st_runs = 0, st_ratio_sum = 0, st_ratio_min = 1000, st_ratio_max = 0;
+
+static inline int set_type(uint32_t set){
+    uint32_t r = set % LEADER_STRIDE;
+    return (r == RRIP_LEADER_OFF) ? 1 : (USE_PSEL && r == IRRIP_LEADER_OFF) ? 2 : 0;
+}
+
+// returns false for rrip and true for irrip
+static inline bool use_irrip(uint32_t set){
+    int t = set_type(set);
+    if (t == 1) return false;
+    if (t == 2) return true;
+    return (USE_PSEL ? (psel >= PSEL_MID) : true) && ratio_ok;
+}
+
+// ratio calculation for threshold method happens only at the end of a 'run' and not every access
+static void end_run() {
+    uint64_t den = c_tacc + c_tmiss;
+    if (den) {
+        uint64_t r = (1000 * (c_iacc + c_imiss)) / den;
+        ratio_ok = r > THRESH_MILLI;
+        st_runs++; st_ratio_sum += r;
+        if (r < st_ratio_min) st_ratio_min = r;
+        if (r > st_ratio_max) st_ratio_max = r;
+    }
+    c_iacc >>= 1; c_imiss >>= 1; c_tacc >>= 1; c_tmiss >>= 1;
+    run_events = 0;
+}
+
+
+// initialize replacement state
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize IRRIP state for L2C" << endl;
+
+    for (int i=0; i<L2C_SET; i++) {
+        for (int j=0; j<L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+        }
+    }
+}
+
+// find replacement victim
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    // look for the maxRRPV line
+    bool irrip = use_irrip(set);
+    while (1) {
+        if (irrip && EVICT_DATA_FIRST) {
+            for (int i = 0; i < L2C_WAY; i++) {
+                if (l2_rrpv[set][i] == maxRRPV && !current_set[i].instruction)
+                    return i;
+            }
+        }
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV)
+                return i;
+        }
+
+        for (int i = 0; i < L2C_WAY; i++){
+            l2_rrpv[set][i]++;
+        }
+    }
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+// called on every cache hit and cache fill
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    string TYPE_NAME;
+    if (type == LOAD)
+        TYPE_NAME = "LOAD";
+    else if (type == RFO)
+        TYPE_NAME = "RFO";
+    else if (type == PREFETCH)
+        TYPE_NAME = "PF";
+    else if (type == WRITEBACK)
+        TYPE_NAME = "WB";
+    else if (type == LOAD_TRANSLATION)
+	TYPE_NAME = "L_TN";
+    else if (type == PREFETCH_TRANSLATION)
+	TYPE_NAME = "P_TN";
+    else if (type == TRANSLATION_FROM_L1D)
+	TYPE_NAME = "TN_L1D";
+    else
+        assert(0);
+
+    if (hit)
+        TYPE_NAME += "_HIT";
+    else
+        TYPE_NAME += "_MISS";
+
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    // uncomment this line to see the L2C accesses
+    // cout << "CPU: " << cpu << "  L2C " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
+    // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
+
+    bool is_instr = isInstruction && (type == LOAD || type == PREFETCH);
+    bool demand = (type == LOAD || type == RFO || type == PREFETCH);
+    int st = set_type(set);
+    
+    if (st && demand) {
+        if (st == 1) {
+            // RRIP leader set for the threshold method
+            c_tacc++;
+            if (!hit) c_tmiss++;
+            if (is_instr) {
+                c_iacc++;
+                if (!hit) c_imiss++;
+            }
+            if (++run_events >= NO_RUNS) end_run();
+        }
+        if (!hit) {
+            int w = is_instr ? INSTR_MISS_W : DATA_MISS_W;
+            if (st == 1) psel = (psel + w > PSEL_MAX) ? PSEL_MAX : psel + w;
+            else psel = (psel - w < 0) ? 0 : psel - w;
+            st_psel_sum += psel;
+            st_psel_n++;
+        }
+    }
+
+    bool irrip = use_irrip(set);
+    if (st == 0 && !hit) {
+        if (irrip) st_follow_irrip++;
+        else st_follow_rrip++;
+    }
+
+    if (!irrip) {
+        l2_rrpv[set][way] = hit ? 0 : maxRRPV - 1;
+        return;
+    }
+
+    if (hit) {
+        if (type == WRITEBACK) return;
+        l2_rrpv[set][way] = is_instr ? PROMO_INSTR : PROMO_DATA;
+    } else {
+        if (type == WRITEBACK) l2_rrpv[set][way] = INS_WB;
+        else if (is_instr) l2_rrpv[set][way] = INS_INSTR;
+        else l2_rrpv[set][way] = INS_DATA;
+    }
+}
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::l2c_replacement_final_stats()
+{
+    uint64_t f = st_follow_irrip + st_follow_rrip;
+    cout << "DYN-IRRIP follower fills in IRRIP mode: "
+         << (f ? 100.0 * st_follow_irrip / f : 0.0) << "%\n"
+         << "final PSEL: " << psel << endl
+         << "mean PSEL: " << (st_psel_n ? st_psel_sum / st_psel_n : 0) << endl
+         << "USE_PSEL: " << USE_PSEL << " W: " << INSTR_MISS_W << " T: " << THRESH_MILLI << endl;
+    
+    cout << "DYN-IRRIP ratio x1000" << endl
+         << "mean: " << (st_runs ? st_ratio_sum / st_runs : 0) << endl
+         << "min: " << st_ratio_min << endl
+         << "max: " << st_ratio_max << endl;
+}
