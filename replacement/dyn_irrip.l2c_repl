@@ -1,45 +1,61 @@
 #include "cache.h"
 
+// Dynamic I-RRIP for the L2C: set dueling between SRRIP and I-RRIP.
+//  - Sets with set % LEADER_STRIDE == RRIP_LEADER_OFF always run SRRIP (RRIP leaders).
+//  - With USE_PSEL, sets with set % LEADER_STRIDE == IRRIP_LEADER_OFF always run I-RRIP.
+//  - All other sets (followers) copy the policy that is currently winning.
+// Two ways to decide (USE_PSEL):
+//  1: PSEL duel. A miss in an RRIP leader raises PSEL, a miss in an I-RRIP leader
+//     lowers it, followers use I-RRIP when PSEL >= 512 (MSB set). An instruction
+//     miss moves PSEL by INSTR_MISS_W because it costs more than a data miss.
+//  0: threshold. The RRIP leaders count instruction vs total accesses and misses,
+//     followers use I-RRIP when (instr_acc + instr_miss) / (tot_acc + tot_miss) > T.
+// Task 3 adds handling of data prefetch packets
+// I-RRIP mode is the Task 2A policy, SRRIP mode is rrip.l2c_repl.
+
 #define maxRRPV 3
 
 // parameters for IRRIP
-#define INS_INSTR 2
-#define INS_DATA 3
-#define INS_WB 3
-#define PROMO_INSTR 0
-#define PROMO_DATA 2
-#define EVICT_DATA_FIRST 1
+#define INS_INSTR 2         // instruction fill
+#define INS_DATA 3          // data fill
+#define INS_WB 3            // writeback fill
+#define PROMO_INSTR 0       // instruction hit
+#define PROMO_DATA 2        // data hit
+#define EVICT_DATA_FIRST 1  // among RRPV 3 lines, evict data before instructions
 
 // parameters for set-dueling
 #define USE_PSEL 1 // 0 is threshold based, 1 is PSEL saturating counter 
 #define INSTR_MISS_W 4 // defines how far an instruction miss moves the weight of PSEL
-#define DATA_MISS_W 1
-#define THRESH_MILLI 0
-#define LEADER_STRIDE 32 // spacing of the leader sets
+#define DATA_MISS_W 1 // a data miss moves PSEL by 1
+#define THRESH_MILLI 0 // threshold T x 1000 (0 = no ratio gate, used with the PSEL duel)
+#define LEADER_STRIDE 32 // spacing of the leader sets (1024 sets / 32 = 32 leaders per policy)
 #define RRIP_LEADER_OFF 0 // set % 32 == <this> run SRRIP
 #define IRRIP_LEADER_OFF 16 // set % 32 == <this> run IRRIP
 #define PSEL_BITS 10
 #define PSEL_MAX ((1 << PSEL_BITS) - 1)
-#define PSEL_MID (1 << (PSEL_BITS - 1))
-#define NO_RUNS 1024
+#define PSEL_MID (1 << (PSEL_BITS - 1)) // starting value and decision boundary
+#define NO_RUNS 1024 // the ratio is evaluated once per 1024 RRIP-leader events
 
 
-// task 3 prefetching parameters
-#define PF_AWARE 1
-#define PF_INS 3
-#define PF_HIT_PROMO 2
-#define PF_EXCLUDE_DUEL 0
-#define PF_PFHIT_DEMOTE 0
+// task 3 prefetching parameters (data prefetches only, applied in I-RRIP mode)
+#define PF_AWARE 1          // 0 = Task 2B behaviour
+#define PF_INS 3            // RRPV for a fill made by a prefetch
+#define PF_HIT_PROMO 2      // RRPV after the first demand hit on a prefetched line
+#define PF_EXCLUDE_DUEL 0   // 1 = data prefetches do not update PSEL / ratio counters
+#define PF_PFHIT_DEMOTE 0   // prefetch hit on a resident line: RRPV = max(RRPV, this), 0 = unchanged
 
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
 
 static int32_t psel = PSEL_MID;
-static bool ratio_ok = true;
+static bool ratio_ok = true; // result of the last ratio test (threshold method)
+
+// ratio counters of the RRIP leaders: instruction accesses/misses, total accesses/misses, events since last run
 static uint64_t c_iacc = 0, c_imiss = 0, c_tacc = 0, c_tmiss = 0, run_events = 0;
 static uint64_t st_follow_irrip = 0, st_follow_rrip = 0; // misses in follower sets while following respective one
 static uint64_t st_psel_sum = 0, st_psel_n = 0; // running sum of PSEL and number of counter updates
 static uint64_t st_runs = 0, st_ratio_sum = 0, st_ratio_min = 1000, st_ratio_max = 0;
 
+// 0 = follower, 1 = RRIP leader, 2 = I-RRIP leader (only with the PSEL duel)
 static inline int set_type(uint32_t set){
     uint32_t r = set % LEADER_STRIDE;
     return (r == RRIP_LEADER_OFF) ? 1 : (USE_PSEL && r == IRRIP_LEADER_OFF) ? 2 : 0;
@@ -53,7 +69,9 @@ static inline bool use_irrip(uint32_t set){
     return (USE_PSEL ? (psel >= PSEL_MID) : true) && ratio_ok;
 }
 
-// ratio calculation for threshold method happens only at the end of a 'run' and not every access
+// The ratio is computed once per run (not on every access): a few events give a noisy
+// ratio and would make the followers flip between policies. After each run the counters
+// are halved, so old history fades out and the ratio follows program phases.
 static void end_run() {
     uint64_t den = c_tacc + c_tmiss;
     if (den) {
@@ -86,17 +104,20 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
     // look for the maxRRPV line
     bool irrip = use_irrip(set);
     while (1) {
+        // I-RRIP mode: a data line at maxRRPV goes first
         if (irrip && EVICT_DATA_FIRST) {
             for (int i = 0; i < L2C_WAY; i++) {
                 if (l2_rrpv[set][i] == maxRRPV && !current_set[i].instruction)
                     return i;
             }
         }
+        // otherwise any line at maxRRPV (the only rule in SRRIP mode)
         for (int i = 0; i < L2C_WAY; i++) {
             if (l2_rrpv[set][i] == maxRRPV)
                 return i;
         }
 
+        // none found: age the whole set and look again
         for (int i = 0; i < L2C_WAY; i++){
             l2_rrpv[set][i]++;
         }
@@ -140,16 +161,17 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     // cout << "CPU: " << cpu << "  L2C " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
     // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
 
+    // demand = counts for the duel (no writebacks)
     bool is_instr = isInstruction && (type == LOAD || type == PREFETCH);
     bool demand = (type == LOAD || type == RFO || type == PREFETCH);
     if (PF_AWARE && PF_EXCLUDE_DUEL && type == PREFETCH && !is_instr)
         demand = false;
     int st = set_type(set);
 
-    
+    // leader sets: update the duel state
     if (st && demand) {
         if (st == 1) {
-            // RRIP leader set for the threshold method
+            // RRIP leader: ratio counters for the threshold method
             c_tacc++;
             if (!hit) c_tmiss++;
             if (is_instr) {
@@ -158,6 +180,7 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
             }
             if (++run_events >= NO_RUNS) end_run();
         }
+        // PSEL: a miss in an RRIP leader pushes towards I-RRIP, a miss in an I-RRIP leader away from it
         if (!hit) {
             int w = is_instr ? INSTR_MISS_W : DATA_MISS_W;
             if (st == 1) psel = (psel + w > PSEL_MAX) ? PSEL_MAX : psel + w;
@@ -168,23 +191,29 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     }
 
     bool irrip = use_irrip(set);
+    // statistics: which policy the followers used on their fills
     if (st == 0 && !hit) {
         if (irrip) st_follow_irrip++;
         else st_follow_rrip++;
     }
 
+    // SRRIP mode: hit -> 0, fill -> maxRRPV - 1 (same as rrip)
     if (!irrip) {
         l2_rrpv[set][way] = hit ? 0 : maxRRPV - 1;
         return;
     }
+
+    // I-RRIP mode. pf = data prefetch packet
     bool pf = (type == PREFETCH) && !is_instr;
 
     if (hit) {
         if (type == WRITEBACK) return;
+        // a prefetch finding the line already in the L2C is not a reuse: no promotion
         if (PF_AWARE && pf) {
             if (l2_rrpv[set][way] < PF_PFHIT_DEMOTE) l2_rrpv[set][way] = PF_PFHIT_DEMOTE;
             return;
         }
+        // first demand hit on a prefetched line: the line has done its job, do not keep it near
         if (PF_AWARE && !is_instr && block[set][way].prefetch) {
             l2_rrpv[set][way] = PF_HIT_PROMO;
             return;
@@ -193,7 +222,7 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     } else {
         if (type == WRITEBACK) l2_rrpv[set][way] = INS_WB;
         else if (is_instr) l2_rrpv[set][way] = INS_INSTR;
-        else if (PF_AWARE && pf) l2_rrpv[set][way] = PF_INS;
+        else if (PF_AWARE && pf) l2_rrpv[set][way] = PF_INS; // prefetched lines are speculative: insert higher
         else l2_rrpv[set][way] = INS_DATA;
     }
 }

@@ -1,48 +1,59 @@
 #include "cache.h"
 
 
-#define IP_TRACKER_COUNT 24
-#define IP_TAG_BITS 8
-#define HIST_LEN 3
+// Stride Pattern Prefetcher (SPP) at the L1D.
+// Each IP gets a tracker entry with two predictors:
+//  - uniform: one stride with a confidence counter (A, A+2, A+4, ...)
+//  - signature: the last HIST_LEN strides are hashed into a small per-IP table that
+//    predicts the next stride, so repeating patterns like +1,+2,+2,+2,+3 are learned
+// A uniform stride is used as soon as it is confident, otherwise the signature
+// predictor is used. A prefetch never crosses the page of the demand access.
+// Accuracy is estimated with a small filter of issued prefetches and sets the degree.
+
+#define IP_TRACKER_COUNT 24   // IPs tracked at once
+#define IP_TAG_BITS 8         // low IP bits used as the tracker tag
+#define HIST_LEN 3            // strides kept in the signature
 #define SIG_SET_BITS 2
 #define SIG_SETS (1 << SIG_SET_BITS)
 #define SIG_WAYS 4
-#define SIG_TABLE_SIZE (SIG_SETS * SIG_WAYS)
+#define SIG_TABLE_SIZE (SIG_SETS * SIG_WAYS)  // signature entries per IP
 #define SIG_TAG_BITS 6
 #define SIG_CONF_MAX 3
-#define SIG_CONF_MIN 1
+#define SIG_CONF_MIN 1        // minimum confidence to use a signature prediction
 #define UNI_CONF_MAX 3
-#define UNI_CONF_THRESH 2
-#define UNI_MISS_PENALTY 1
-#define MAX_STRIDE 63
-#define STRIDE_BITS 7
+#define UNI_CONF_THRESH 2     // uniform mode from this confidence on
+#define UNI_MISS_PENALTY 1    // confidence lost on a different stride
+#define MAX_STRIDE 63         // larger strides (in lines) are ignored and reset the IP
+#define STRIDE_BITS 7         // signed stride width, only used for the storage count
 
-#define PF_FILTER_BITS 6
+#define PF_FILTER_BITS 6      // direct mapped filter of recently issued prefetches
 #define PF_FILTER_SIZE (1 << PF_FILTER_BITS)
 #define PF_FILTER_TAG_BITS 12
-#define EPOCH_ISSUED 256
-#define ACC_LOW 40
-#define ACC_HIGH 75
+#define EPOCH_ISSUED 256      // accuracy is checked after this many issued prefetches
+#define ACC_LOW 40            // accuracy (%) below this -> degree DEG_LOW
+#define ACC_HIGH 75           // accuracy (%) above this -> degree DEG_HIGH
 #define DEG_LOW 1
 #define DEG_HIGH 4
 #define DEG_MID 2
-#define LINE_ADDR_BITS 58
+#define LINE_ADDR_BITS 58     // only used for the storage count
 
+// one signature entry: hashed history tag -> next stride and its confidence
 struct SIG_ENTRY{
 
     uint8_t tag;
     int8_t next;
-    uint8_t conf;
+    uint8_t conf;     // 0 means the entry is empty
 };
 
+// per-IP state
 class IP_TRACKER{
     public:
         uint64_t ip_tag;
-        uint64_t last_line;
-        int8_t uni_stride;
+        uint64_t last_line;   // last cache line accessed by this IP
+        int8_t uni_stride;    // uniform predictor: candidate stride and confidence
         uint8_t uni_conf;
-        int8_t hist[HIST_LEN];
-        uint32_t lru;
+        int8_t hist[HIST_LEN];  // last strides, oldest first
+        uint32_t lru;         // 0 = most recently used tracker
         SIG_ENTRY sig[SIG_TABLE_SIZE];
 
 };
@@ -56,12 +67,15 @@ struct PF_FILTER_ENTRY{
 static IP_TRACKER trackers[IP_TRACKER_COUNT];
 static PF_FILTER_ENTRY pf_filter[PF_FILTER_SIZE];
 
+// accuracy bookkeeping for the current epoch, and the degree it selects
 static uint32_t epoch_issued, epoch_useful;
 static uint32_t cur_degree;
 
+// statistics for the final printout
 static uint64_t tot_issued, tot_useful, issued_pattern, issued_uniform;
 static uint64_t epochs, deg_hist[DEG_HIGH+1];
 
+// hash of the stride history (FNV style), used to index the signature table
 static inline uint32_t sig_hash(const int8_t* h){
     uint32_t x = 2166136261u;
     for(int i = 0; i < HIST_LEN; i++){
@@ -79,6 +93,7 @@ static inline uint32_t sig_tag(uint32_t h){
     return (h >> SIG_SET_BITS) & ((1u << SIG_TAG_BITS) - 1);
 }
 
+// look up a history hash in the tracker's signature table (NULL if not present)
 static SIG_ENTRY *sig_find(IP_TRACKER &t, uint32_t h){
     SIG_ENTRY *set = &t.sig[sig_set(h) * SIG_WAYS];
     for (int i = 0; i < SIG_WAYS; i++){
@@ -93,6 +108,7 @@ static inline uint16_t pf_filter_tag(uint64_t addr){
     return (addr >> PF_FILTER_BITS) & ((1u << PF_FILTER_TAG_BITS) - 1);
 }
 
+// make a tracker the most recently used one (lru ranks stay a permutation of 0..N-1)
 static void touch(int index){
     for (int i = 0 ; i < IP_TRACKER_COUNT; i++){
         if (trackers[i].lru < trackers[index].lru)trackers[i].lru++;}
@@ -118,11 +134,13 @@ void CACHE::l1d_prefetcher_initialize()
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
+    // train on demand loads only
     if (type != LOAD) return;
 
     uint64_t cl = addr >> LOG2_BLOCK_SIZE;
     uint64_t page = addr >> LOG2_PAGE_SIZE;
 
+    // a demand load to a line we prefetched counts as a useful prefetch
     PF_FILTER_ENTRY &fe = pf_filter[cl & (PF_FILTER_SIZE - 1)];
     if (fe.valid && fe.tag == pf_filter_tag(cl)){
         fe.valid = false;
@@ -130,6 +148,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         tot_useful++;
     }
 
+    // find the tracker of this IP
     uint64_t tag = ip & ((1ull << IP_TAG_BITS) - 1);
     int index = -1;
     for(int i = 0; i < IP_TRACKER_COUNT; i++){
@@ -139,6 +158,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         }
     }
 
+    // new IP: replace the least recently used tracker, no prefetch on the first access
     if (index < 0){
         for (int i = 0 ; i< IP_TRACKER_COUNT; i++){
             if (trackers[i].lru == (IP_TRACKER_COUNT - 1)){
@@ -157,9 +177,11 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         return;
     }
 
+    // stride in cache lines since the last access of this IP
     IP_TRACKER &t = trackers[index];
     int64_t stride = (int64_t)cl - (int64_t)t.last_line;
-    if (stride == 0) {touch(index); return;}
+    if (stride == 0) {touch(index); return;}   // same line again: nothing to learn
+    // jump too large to be a stride: restart the pattern for this IP
     if (stride > MAX_STRIDE || stride < -MAX_STRIDE) {
         t.last_line = cl;
         t.uni_stride = 0;
@@ -172,6 +194,8 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     int8_t s = (int8_t)stride;
 
     //training the uniform predictor
+    // same stride: gain confidence. Different stride: lose confidence, and only
+    // switch to the new stride once the old one has run out of confidence.
     if (s == t.uni_stride){
         if (t.uni_conf < UNI_CONF_MAX) t.uni_conf++;
     } else {
@@ -182,6 +206,8 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     }
 
     //training the signature table
+    // the history before this access predicted stride s: strengthen a matching entry,
+    // weaken a wrong one, or allocate a new entry in a free (or fully decayed) way
 
     uint32_t h = sig_hash(t.hist);  
     SIG_ENTRY *e = sig_find(t, h);
@@ -206,17 +232,21 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         else weakest -> conf--;
     }
 
+    // shift the new stride into the history
     for (int i=0; i<HIST_LEN-1; i++) t.hist[i] = t.hist[i+1];
     t.hist[HIST_LEN-1] = s;
     t.last_line = cl;
     touch(index);
 
+    // uniform stride has priority, the signature predictor is the fallback
     bool uniform_mode = (t.uni_conf >= UNI_CONF_THRESH);
+    // issue one prefetch. Returns false if the caller should stop (page boundary, queue full).
     auto issue = [&](uint64_t pf_line) -> bool{
-        if ((pf_line >> (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE)) != page) return false;
+        if ((pf_line >> (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE)) != page) return false;   // do not cross the page
         PF_FILTER_ENTRY &f = pf_filter[pf_line & (PF_FILTER_SIZE - 1)];
         if (f.valid && f.tag == pf_filter_tag(pf_line))
-            return true;
+            return true;                                                          // already prefetched
+        // fill the L1D while the MSHR has room, otherwise only the L2C
         int fill = (MSHR.occupancy < (MSHR.SIZE>>1)) ? FILL_L1 : FILL_L2;
         if (!prefetch_line(ip, addr, pf_line << LOG2_BLOCK_SIZE, fill, 0)) return false;
         f.valid = true; f.tag = pf_filter_tag(pf_line);
@@ -228,11 +258,13 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     };
 
     if (uniform_mode){
+        // stride, 2*stride, ... up to the current degree
         for (uint32_t d = 1; d <= cur_degree;d++){
             if (!issue((uint64_t)((int64_t)cl + (int64_t)((int64_t)t.uni_stride * d)))) break;
         }
     }
     else{
+        // walk the signature table: predict a stride, move the history forward, repeat
         int8_t tmp[HIST_LEN];
         for(int i = 0 ; i < HIST_LEN; i++) tmp[i] = t.hist[i];
         uint64_t cursor = cl;
@@ -246,6 +278,8 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         }
     }
 
+    // accuracy-based throttling: after every EPOCH_ISSUED prefetches pick the degree
+    // for the next epoch from the fraction that were used by a demand load
     if (epoch_issued >= EPOCH_ISSUED){
         uint32_t acc = (epoch_useful * 100) / epoch_issued;
         cur_degree = (acc < ACC_LOW) ? DEG_LOW : (acc > ACC_HIGH) ? DEG_HIGH : DEG_MID;
@@ -275,7 +309,8 @@ void CACHE::l1d_prefetcher_final_stats()
     cout << "SPP epochs: " << epochs << "  degree chosen LOW/MID/HIGH epochs: "
          << deg_hist[DEG_LOW] << "/" << deg_hist[DEG_MID] << "/" << deg_hist[DEG_HIGH] << endl;
 
-    // storage overhead, bit-exact (logical field widths, not C++ type sizes)
+    // per tracker: IP tag, last line, uniform stride+conf, history, LRU rank and the signature table
+    // plus the prefetch filter and the epoch counters
     uint32_t sig_bits = SIG_TAG_BITS + STRIDE_BITS + ceil_log2(SIG_CONF_MAX + 1);
     uint32_t trk_bits = IP_TAG_BITS + LINE_ADDR_BITS + STRIDE_BITS + ceil_log2(UNI_CONF_MAX + 1)
                       + HIST_LEN * STRIDE_BITS + ceil_log2(IP_TRACKER_COUNT)
