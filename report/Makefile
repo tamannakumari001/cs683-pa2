@@ -5,7 +5,7 @@ DOC      = report
 LATEXMK  = latexmk -pdf -interaction=nonstopmode -halt-on-error
 # Figures live outside report/, so rebuild when any of them change.
 FIGS     = $(wildcard ../results/*/plots/*.png)
-TEAM    ?= "Arch-enemies of Latency_24B1021_24B1015_24B1037_24B0995"
+TEAM    ?= "Arch-enemies_of_Latency_24B1021_24B1015_24B1037_24B0995"
 ROOT     = $(abspath ..)
 REPO     = $(notdir $(ROOT))
 
@@ -33,8 +33,7 @@ package: summary
 	  --exclude='$(REPO)/obj' --exclude='$(REPO)/.git' \
 	  --exclude='$(REPO)/temp' --exclude='$(REPO)/PLAN.md' \
 	  --exclude='__pycache__' --exclude='*.pyc' --exclude='*.part' \
-	  --exclude='$(REPO)/report/*.aux' --exclude='$(REPO)/report/*.log' \
-	  --exclude='$(REPO)/report/*.out' --exclude='$(REPO)/report/*.fls' \
+	  --exclude='$(REPO)/report' \
 	  --exclude='$(REPO)/scripts' \
 	  --exclude='$(REPO)/report/*.fdb_latexmk' --exclude='$(REPO)/report/*.synctex.gz' \
 	  -czf $(TEAM)_pa2.tar.gz $(REPO)
